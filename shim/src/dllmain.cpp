@@ -381,7 +381,7 @@ class SimpleMiniMap final : public CppUserModBase
     SimpleMiniMap()
     {
         ModName = STR("SimpleMiniMap");
-        ModVersion = STR("0.1.0");
+        ModVersion = STR("0.1.1");
         ModDescription = STR("A minimap for Palworld");
         ModAuthors = STR("SalahaldinBilal");
         s_instance = this;
