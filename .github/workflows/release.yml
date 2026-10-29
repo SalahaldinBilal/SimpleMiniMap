@@ -36,6 +36,10 @@ jobs:
             Write-Output "::error::Version in workshop/Info.json doesn't match version $version in core/Cargo.toml."
             exit 1
           }
+          if (-not (Select-String -Path CHANGELOG.md -SimpleMatch "## [$version]" -Quiet)) {
+            Write-Output "::error::No '## [$version]' section in CHANGELOG.md. Run ./scripts/bump-version.ps1 $version before tagging."
+            exit 1
+          }
           "version=$version" >> $env:GITHUB_OUTPUT
 
   build:
