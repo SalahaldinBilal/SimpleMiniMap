@@ -1,0 +1,25 @@
+{
+  "ModName": "SimpleMiniMap",
+  "PackageName": "SimpleMiniMap",
+  "Thumbnail": "thumbnail.png",
+  "Version": "0.1.0",
+  "DebugMode": false,
+  "MinRevision": 82182,
+  "Author": "SalahaldinBilal",
+  "Dependencies": [
+    "UE4SSExperimentalPW"
+  ],
+  "Tags": [
+    "UE4SS",
+    "Utilities",
+    "User Interface"
+  ],
+  "InstallRule": [
+    {
+      "Type": "UE4SS",
+      "Targets": [
+        "./UE4SS/Mods"
+      ]
+    }
+  ]
+}
