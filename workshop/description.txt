@@ -1,0 +1,39 @@
+A minimap for Palworld, built as a native UE4SS mod so it costs next to nothing per frame.
+
+Requires [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3625223587]UE4SS Experimental (Palworld)[/url] from the Workshop.
+
+[h2]Features[/h2]
+[list]
+[*]A corner minimap that uses the game's own map, its explored-area clouds and its icons.
+[*]Rendered terrain: the ground around you is captured from above once per area and kept, so it is far more detailed than the map art. It works in the overworld and in dungeons, where roofs are left out so you can see the rooms.
+[*]Markers for fast travel points, bases, dungeons, towers, bosses, quests, warps, oil rigs, supply drops, treasure maps, death drops and pins.
+[*]Markers for wild, shiny and own pals, humans and other players, with pal portraits and an above or below arrow when they are on another level.
+[*]Markers for chests, eggs, effigies, notes, junk, ore, skill fruit trees, lotuses, forage, fishing spots and items lying on the ground. Every type can be switched on or off.
+[*]Landmarks (fast travel points, bases, dungeons, towers, bosses, quests and warps) stay readable when zoomed out, and the nearest ones off the minimap are pinned to its edge.
+[*]Smooth zoom, icons that scale with zoom, a separate zoom for dungeons, and an optional auto zoom that widens the view while you move fast.
+[*]North-up or rotating with the camera, a view cone, any corner, any size, square to round.
+[*]Hides itself on game menus, during teleports and loading fades, and (optionally) inside your bases.
+[*]An in-game settings window.
+[/list]
+
+[h2]Keys[/h2]
+[list]
+[*][b]Alt+J[/b] opens the settings window
+[*][b]Alt+N[/b] shows or hides the minimap
+[*][b]Alt+=[/b] or [b]Alt+Numpad Plus[/b] zooms in
+[*][b]Alt+-[/b] or [b]Alt+Numpad Minus[/b] zooms out
+[*][b]Alt+K[/b] turns megazoom on or off (a wide view, 1500 m by default)
+[/list]
+Every key can be rebound in the settings window.
+
+[h2]Settings[/h2]
+Settings save as you change them. They are also kept in settings.ini in the mod's folder, with a comment above each option.
+
+[h2]Notes[/h2]
+[list]
+[*]Rendered terrain uses fixed lighting, so tiles match at any time of day. Lakes that get their colour from reflecting the sky can show through to the lake bed, and lamps can brighten tiles captured near them at night.
+[*]Built against the UE4SS version the Workshop serves. When UE4SS Experimental updates, update this mod too.
+[/list]
+
+[h2]Source code[/h2]
+The source code is on [url=https://github.com/SalahaldinBilal/SimpleMiniMap]GitHub[/url], along with bug reports, the changelog and manual downloads.

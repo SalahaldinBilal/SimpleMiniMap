@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  check:
+    name: Check version
+    if: github.actor == 'SalahaldinBilal'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the mod version
+        id: version
+        run: |
+          $version = (Select-String -Path core/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and "v$version" -ne $env:GITHUB_REF_NAME) {
+            Write-Output "::error::Tag $env:GITHUB_REF_NAME doesn't match version $version in core/Cargo.toml."
+            exit 1
+          }
+          if (-not (Select-String -Path shim/src/dllmain.cpp -SimpleMatch "ModVersion = STR(`"$version`")" -Quiet)) {
+            Write-Output "::error::ModVersion in shim/src/dllmain.cpp doesn't match version $version in core/Cargo.toml."
+            exit 1
+          }
+          if ((Get-Content workshop/Info.json -Raw | ConvertFrom-Json).Version -ne $version) {
+            Write-Output "::error::Version in workshop/Info.json doesn't match version $version in core/Cargo.toml."
+            exit 1
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+  build:
+    name: Build
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          token: ${{ secrets.UEPSEUDO_PAT }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Game__Shipping__Win64 -DSMM_DEPLOY=OFF
+          cmake --build build --target SimpleMiniMap
+
+      - name: Package
+        run: |
+          $dll = Get-ChildItem build -Recurse -Filter main.dll | Where-Object { $_.FullName -notlike '*\_deps\*' } | Select-Object -First 1
+          if (-not $dll) { Write-Output "::error::main.dll not found in build output"; exit 1 }
+          $mod = New-Item -ItemType Directory -Force package/SimpleMiniMap/dlls
+          Copy-Item $dll.FullName $mod
+          New-Item -ItemType File package/SimpleMiniMap/enabled.txt | Out-Null
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mod
+          path: package
+          retention-days: 1
+
+  deploy:
+    name: Deploy
+    needs: [check, build]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: mod
+          path: package
+
+      - name: Read release notes
+        run: |
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $match = [regex]::Match($changelog, "(?ms)^## \[$([regex]::Escape($env:VERSION))\][^\n]*\n(.*?)(?=^## \[|\z)")
+          if (-not $match.Success) { Write-Output "::error::No '## [$env:VERSION]' section in CHANGELOG.md"; exit 1 }
+          Set-Content release-notes.md $match.Groups[1].Value.Trim()
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = "SimpleMiniMap-$env:VERSION.zip"
+          Compress-Archive -Path package/SimpleMiniMap -DestinationPath $zip
+          gh release create "v$env:VERSION" $zip --title "v$env:VERSION" --notes-file release-notes.md
+
+      - name: Steam Workshop
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_CONFIG_VDF: ${{ secrets.STEAM_CONFIG_VDF }}
+          WORKSHOP_ITEM_ID: ${{ vars.WORKSHOP_ITEM_ID }}
+        run: |
+          $root = (Get-Location).Path -replace '\\', '/'
+          $content = New-Item -ItemType Directory -Force workshop-content
+          $mods = New-Item -ItemType Directory -Force workshop-content/UE4SS/Mods
+          Copy-Item -Recurse package/SimpleMiniMap $mods
+          Copy-Item workshop/thumbnail.png $content
+          Copy-Item workshop/Info.json $content
+
+          $description = (Get-Content workshop/description.txt -Raw).Trim()
+          $notes = (Get-Content release-notes.md -Raw).Trim()
+          foreach ($text in @($description, $notes)) {
+            if ($text -match '["\\]') { Write-Output "::error::Workshop description and release notes can't contain double quotes or backslashes"; exit 1 }
+          }
+          if ($description.Length -gt 8000) { Write-Output "::error::Workshop description is over Steam's 8000 character limit"; exit 1 }
+
+          $itemId = if ($env:WORKSHOP_ITEM_ID) { $env:WORKSHOP_ITEM_ID } else { "0" }
+          @"
+          "workshopitem"
+          {
+            "appid" "1623730"
+            "publishedfileid" "$itemId"
+            "contentfolder" "$root/workshop-content"
+            "previewfile" "$root/workshop-content/thumbnail.png"
+            "title" "SimpleMiniMap"
+            "description" "$description"
+            "changenote" "v$env:VERSION`n$notes"
+          }
+          "@ | Set-Content -Encoding utf8 workshop-item.vdf
+
+          Invoke-WebRequest https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip -OutFile steamcmd.zip
+          Expand-Archive steamcmd.zip steamcmd
+          & steamcmd/steamcmd.exe +quit | Out-Null
+          New-Item -ItemType Directory -Force steamcmd/config | Out-Null
+          [IO.File]::WriteAllBytes("$root/steamcmd/config/config.vdf", [Convert]::FromBase64String($env:STEAM_CONFIG_VDF))
+
+          $output = & steamcmd/steamcmd.exe +login $env:STEAM_USERNAME +workshop_build_item "$root/workshop-item.vdf" +quit 2>&1 | Out-String
+          Write-Output $output
+          if ($output -notmatch 'Success') { Write-Output "::error::Workshop upload failed"; exit 1 }
+          if ($itemId -eq "0") {
+            Write-Output "New Workshop item created. Save its publishedfileid below as the WORKSHOP_ITEM_ID repository variable:"
+            Get-Content workshop-item.vdf | Select-String publishedfileid
+          }
+          exit 0

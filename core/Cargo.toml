@@ -1,0 +1,14 @@
+[package]
+name = "simpleminimap_core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+debug = "line-tables-only"
