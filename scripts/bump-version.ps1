@@ -40,7 +40,9 @@ if (-not $body) {
 }
 $date = Get-Date -Format 'yyyy-MM-dd'
 $released = if ($body) { "## [Unreleased]`n`n## [$Version] - $date`n`n$body`n" } else { "## [Unreleased]`n`n## [$Version] - $date`n" }
-$changelog = $changelog.Substring(0, $section.Index) + $released + $changelog.Substring($section.Index + $section.Length)
+$rest = $changelog.Substring($section.Index + $section.Length)
+if ($rest) { $released += "`n" }
+$changelog = $changelog.Substring(0, $section.Index) + $released + $rest
 [IO.File]::WriteAllText($changelogPath, $changelog)
 Write-Output 'Updated CHANGELOG.md'
 
