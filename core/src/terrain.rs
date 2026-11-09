@@ -48,22 +48,17 @@ const MAP_LIGHT_ROTATION: Rotator = Rotator { pitch: -50.0, yaw: 135.0, roll: 0.
 // The fill comes from straight above at this share of the key light's brightness, so nothing is left unlit.
 const FILL_LIGHT_ROTATION: Rotator = Rotator { pitch: -90.0, yaw: 0.0, roll: 0.0 };
 const FILL_SHARE: f32 = 0.6;
-const MAP_LIGHT_START: f32 = 10.0;
-const MAP_LIGHT_RANGE: (f32, f32) = (0.01, 500.0);
-// Exposure is fixed, but what a fixed exposure comes out at is up to the game's post process setup. So the map
-// light is scaled once per world from a test capture: these many warm-up captures, then one is read back and
-// the light is set so this share of the ground's pixels is darker than the target brightness.
-const CALIBRATION_WARMUP: u32 = 2;
-const CALIBRATION_PERCENTILE: f32 = 0.7;
-const CALIBRATION_TARGET: f32 = 0.2;
-const CALIBRATION_ROUNDS: u32 = 4;
-const CLIPPED: f32 = 0.95;
+// The key light's brightness, with the map look's tint and without it: what a per-world calibration settled on
+// over grassland, every time. Fixed, so every tile matches wherever the session starts.
+const MAP_LIGHT_INTENSITY: f32 = 15.0;
+const NATURAL_LIGHT_INTENSITY: f32 = 7.4;
 
-// Fitted to the game's map art: the map lights' color, then the curve x(1 + 8x) / 3.4 on each captured tile.
+// Fitted to the game's map art: the map lights' color, then a curve on each captured tile. The curve's powers of
+// x, from x to x⁴: it darkens grass and trees and keeps sand where it is, then levels off so bright sand and snow
+// end near 0.8 instead of clipping to white.
 const MAP_LIGHT_COLOR: LinearColor = LinearColor { r: 0.4, g: 0.5, b: 1.0, a: 1.0 };
 const NATURAL_LIGHT_COLOR: LinearColor = LinearColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
-const CURVE_SQUARE: f32 = 8.0 / 3.4;
-const CURVE_LINEAR: f32 = 1.0 / 3.4;
+const CURVE: [f32; 4] = [0.0295, 5.2278, -7.6441, 3.1868];
 // Water is found by capturing the tile again with it hidden: wherever the two differ by more than 1/50, it is
 // painted the game's map water color, fading out where shallow water barely changes the ground under it.
 const WATER_MASK_GAIN: f32 = 50.0;
@@ -178,15 +173,6 @@ struct SkyPause {
     dimmed: Vec<(Obj, f32)>,
     map_lights: [Obj; 2],
 }
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Calibration {
-    Warming { done: u32, round: u32 },
-    Measuring { round: u32 },
-    Done,
-}
-
-const CALIBRATION_START: Calibration = Calibration::Warming { done: 0, round: 0 };
 
 /// The ground's height range across a tile, from the survey.
 #[derive(Clone, Copy, Debug)]
@@ -425,10 +411,6 @@ pub struct Terrain {
     component: Option<(Weak, Weak)>,
     /// The key and fill lights, and the pawn they are on.
     map_lights: Option<([Weak; 2], Weak)>,
-    /// The key light's calibrated brightness. The fill is a fixed share of it.
-    map_light_intensity: f32,
-    calibration: Calibration,
-    scratch: Option<Weak>,
     failures: u32,
     broken: bool,
     tiles: HashMap<TileKey, Tile>,
@@ -547,9 +529,6 @@ impl Terrain {
             sky_light_class,
             component: None,
             map_lights: None,
-            map_light_intensity: MAP_LIGHT_START,
-            calibration: CALIBRATION_START,
-            scratch: None,
             failures: 0,
             broken: false,
             tiles: HashMap::new(),
@@ -578,8 +557,6 @@ impl Terrain {
         self.forget_tiles();
         self.component = None;
         self.map_lights = None;
-        self.calibration = CALIBRATION_START;
-        self.scratch = None;
         self.sky = None;
         if let Some(style) = &mut self.style {
             style.world_unload();
@@ -609,9 +586,8 @@ impl Terrain {
 
         let styled = settings.map_colors && self.style.as_ref().is_some_and(|style| !style.broken);
         if self.styled.replace(styled).is_some_and(|before| before != styled) {
-            // The kept tiles have the other look, and the light's brightness was fitted for its other color.
+            // The kept tiles have the other look, and the lights have the other color and brightness.
             self.drop_tiles(w, layers, |_| true);
-            self.calibration = CALIBRATION_START;
             self.color_map_lights();
             host::info(if styled { "terrain colored like the game's map" } else { "terrain in natural colors" });
         }
@@ -684,12 +660,7 @@ impl Terrain {
         }
         if let Some((key, ground)) = missing {
             self.next_capture = now + CAPTURE_GAP;
-            let result = if self.calibration != Calibration::Done {
-                profile::time("terrain calibration", || self.calibrate(player, key, ground))
-            } else {
-                profile::time("terrain capture", || self.capture_tile(w, layers, player, key, ground))
-            };
-            match result {
+            match profile::time("terrain capture", || self.capture_tile(w, layers, player, key, ground)) {
                 Ok(()) => self.failures = 0,
                 Err(reason) => {
                     self.failures += 1;
@@ -952,8 +923,8 @@ impl Terrain {
                 self.destroy(Some((light, owner)));
             }
         }
-        let key = self.make_map_light(pawn, MAP_LIGHT_ROTATION, self.map_light_intensity)?;
-        let fill = match self.make_map_light(pawn, FILL_LIGHT_ROTATION, self.map_light_intensity * FILL_SHARE) {
+        let key = self.make_map_light(pawn, MAP_LIGHT_ROTATION, 1.0)?;
+        let fill = match self.make_map_light(pawn, FILL_LIGHT_ROTATION, FILL_SHARE) {
             Ok(fill) => fill,
             Err(reason) => {
                 self.destroy(Some((Weak::new(key), Weak::new(pawn))));
@@ -964,19 +935,14 @@ impl Terrain {
         Ok([key, fill])
     }
 
-    /// Sets both map lights to the calibrated brightness, keeping their ratio.
-    fn set_map_light_intensity(&mut self, intensity: f32) {
-        self.map_light_intensity = intensity;
-        let Some((lights, _)) = self.map_lights else { return };
-        for (light, share) in lights.into_iter().zip([1.0, FILL_SHARE]) {
-            if let Some(light) = light.get() {
-                self.set_light_intensity.call(light, |a| a.set(0, intensity * share));
-            }
-        }
+    /// The key light's brightness for the current look. The fill is a share of it.
+    fn light_intensity(&self) -> f32 {
+        if self.styled == Some(true) { MAP_LIGHT_INTENSITY } else { NATURAL_LIGHT_INTENSITY }
     }
 
-    fn make_map_light(&mut self, pawn: Obj, rotation: Rotator, intensity: f32) -> Result<Obj, String> {
+    fn make_map_light(&mut self, pawn: Obj, rotation: Rotator, share: f32) -> Result<Obj, String> {
         let class = self.map_light_class;
+        let intensity = self.light_intensity() * share;
         let light = self.add_component(pawn, class, |terrain, light| {
             let set = ue::set_bool_property(light, "bVisible", false)
                 && ue::set_bool_property(light, "CastShadows", false)
@@ -1008,10 +974,15 @@ impl Terrain {
         }
     }
 
+    /// Gives both map lights the current look's color and brightness.
     fn color_map_lights(&mut self) {
         let Some((lights, _)) = self.map_lights else { return };
-        for light in lights.into_iter().filter_map(Weak::get) {
-            self.color_light(light);
+        let intensity = self.light_intensity();
+        for (light, share) in lights.into_iter().zip([1.0, FILL_SHARE]) {
+            if let Some(light) = light.get() {
+                self.color_light(light);
+                self.set_light_intensity.call(light, |a| a.set(0, intensity * share));
+            }
         }
     }
 
@@ -1127,16 +1098,6 @@ impl Terrain {
         Ok(target)
     }
 
-    /// Where calibration captures land. The capture holds on to it while it is its target.
-    fn scratch(&mut self, world: Obj) -> Result<Obj, String> {
-        if let Some(scratch) = self.scratch.and_then(Weak::get) {
-            return Ok(scratch);
-        }
-        let scratch = self.new_target(world, RGBA8_SRGB)?;
-        self.scratch = Some(Weak::new(scratch));
-        Ok(scratch)
-    }
-
     /// One of the map look's targets, made and kept on a widget when missing.
     fn held_target(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj, which: Held) -> Result<Obj, String> {
         let Some(style) = &mut self.style else { return Err("the map look is not available".into()) };
@@ -1203,14 +1164,15 @@ impl Terrain {
     }
 
     /// The map look over a captured tile, all on the GPU. With `dry` (the same capture with water hidden): a
-    /// mask m of where the two differ, blurred. Then the contrast curve, a·T² + b·T. Then the water:
-    /// T·(1 − m) + shallow·m + (deep − shallow)·m², deep inside the water and shallow along its soft edge.
+    /// mask m of where the two differ, blurred. Then the curve, worked out from the highest power down with a
+    /// white target as the constant. Then the water: T·(1 − m) + shallow·m + (deep − shallow)·m², deep inside the
+    /// water and shallow along its soft edge.
     fn grade(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj, tile: Obj, dry: Option<Obj>) -> Result<(), String> {
         if self.styled != Some(true) {
             return Ok(());
         }
         let scratch = self.held_target(w, layers, world, Held::Scratch)?;
-        let squared = if dry.is_some() { Some(self.held_target(w, layers, world, Held::Squared)?) } else { None };
+        let squared = self.held_target(w, layers, world, Held::Squared)?;
         let rendering = self.rendering;
         let Some(style) = &mut self.style else { return Ok(()) };
         if let Some(dry) = dry {
@@ -1225,18 +1187,31 @@ impl Terrain {
             style.draw(rendering, world, scratch, &blur_passes(dry, true))?;
             style.draw(rendering, world, dry, &blur_passes(scratch, false))?;
         }
+        // The squared target is free until the water step, so it stands in as white here.
+        let white = squared;
+        style.clear_target.call(rendering, |a| {
+            a.set_obj(0, Some(world));
+            a.set_obj(1, Some(white));
+            a.set(2, gray(1.0));
+        });
+        let [linear, square, cube, fourth] = CURVE;
         style.draw(
             rendering,
             world,
             scratch,
             &[
-                pass(tile, gray(CURVE_SQUARE), BLEND_OPAQUE),
+                pass(white, gray(fourth), BLEND_OPAQUE),
                 pass(tile, gray(1.0), BLEND_MODULATE),
-                pass(tile, gray(CURVE_LINEAR), BLEND_ADDITIVE),
+                pass(white, gray(cube), BLEND_ADDITIVE),
+                pass(tile, gray(1.0), BLEND_MODULATE),
+                pass(white, gray(square), BLEND_ADDITIVE),
+                pass(tile, gray(1.0), BLEND_MODULATE),
+                pass(white, gray(linear), BLEND_ADDITIVE),
+                pass(tile, gray(1.0), BLEND_MODULATE),
             ],
         )?;
         style.draw(rendering, world, tile, &[pass(scratch, gray(1.0), BLEND_OPAQUE)])?;
-        if let (Some(mask), Some(squared)) = (dry, squared) {
+        if let Some(mask) = dry {
             style.draw(rendering, world, squared, &[pass(mask, gray(1.0), BLEND_OPAQUE), pass(mask, gray(1.0), BLEND_MODULATE)])?;
             style.clear_target.call(rendering, |a| {
                 a.set_obj(0, Some(world));
@@ -1316,47 +1291,6 @@ impl Terrain {
         Ok(((camera_z - deepest) / 100.0, dry.is_some()))
     }
 
-    /// One step of fitting the map light to the fixed exposure: a few warm-up captures, then the last one is read
-    /// back once and the light scaled to bring the ground to a normal brightness. Repeated if the reading was
-    /// clipped or far off. Only the reading stalls the game, once or twice per world.
-    fn calibrate(&mut self, player: &Player, key: TileKey, ground: Ground) -> Result<(), String> {
-        let world = player.world;
-        let scratch = self.scratch(world)?;
-        match self.calibration {
-            Calibration::Warming { done, round } => {
-                self.render(player, key, ground, scratch, None)?;
-                self.calibration = if done + 1 >= CALIBRATION_WARMUP {
-                    Calibration::Measuring { round }
-                } else {
-                    Calibration::Warming { done: done + 1, round }
-                };
-            }
-            Calibration::Measuring { round } => {
-                let started = Instant::now();
-                let mut pixels = Vec::with_capacity((TILE_PIXELS * TILE_PIXELS) as usize);
-                ue::read_render_target(world, scratch, &mut pixels)?;
-                let read_ms = started.elapsed().as_secs_f64() * 1000.0;
-                let Some(level) = ground_level(&pixels) else {
-                    return Err("the calibration capture came out empty".into());
-                };
-                let gain = (CALIBRATION_TARGET / level.max(1e-4)).clamp(1.0 / 64.0, 64.0);
-                let before = self.map_light_intensity;
-                self.set_map_light_intensity((before * gain).clamp(MAP_LIGHT_RANGE.0, MAP_LIGHT_RANGE.1));
-                let off = (gain - 1.0).abs() > 0.25 || level >= CLIPPED;
-                let again = off && round + 1 < CALIBRATION_ROUNDS && self.map_light_intensity != before;
-                host::info(&format!(
-                    "terrain light calibration {}: ground at {level:.3}, light {before:.2} to {:.2}, read back in {read_ms:.1} ms{}",
-                    round + 1,
-                    self.map_light_intensity,
-                    if again { ", checking again" } else { ", done" }
-                ));
-                self.calibration = if again { Calibration::Warming { done: CALIBRATION_WARMUP - 1, round: round + 1 } } else { Calibration::Done };
-            }
-            Calibration::Done => {}
-        }
-        Ok(())
-    }
-
     fn capture_tile(&mut self, w: &mut Widgets, layers: &mut Layers, player: &Player, key: TileKey, ground: Ground) -> Result<(), String> {
         let started = Instant::now();
         let world = player.world;
@@ -1410,23 +1344,4 @@ impl Terrain {
             }
         }
     }
-}
-
-/// How bright the ground in a capture is: the linear brightness that this share of its non-black pixels stays
-/// under. `pixels` are BGRA, stored sRGB-encoded. None when almost everything is black.
-fn ground_level(pixels: &[u32]) -> Option<f32> {
-    let decode = |channel: u32| {
-        let value = channel as f32 / 255.0;
-        if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
-    };
-    let mut levels: Vec<f32> = pixels
-        .iter()
-        .map(|&p| 0.2126 * decode((p >> 16) & 0xFF) + 0.7152 * decode((p >> 8) & 0xFF) + 0.0722 * decode(p & 0xFF))
-        .filter(|&level| level > 0.002)
-        .collect();
-    if levels.len() < pixels.len() / 10 {
-        return None;
-    }
-    levels.sort_by(f32::total_cmp);
-    Some(levels[((levels.len() - 1) as f32 * CALIBRATION_PERCENTILE) as usize])
 }
