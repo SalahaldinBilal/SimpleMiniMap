@@ -41,7 +41,7 @@ Changing the host interface: `SMM_HOST_API_VERSION` in `smm_host.h` and `API_VER
 - `lib.rs`: entry points, frame budget, key handling, actor event queue, panic logging.
 - `host.rs`, `ue.rs`: the host table, `Obj`, `Weak` (engine weak pointer), `Function` (resolves a UFunction and its parameter offsets by name, calls ProcessEvent, reads out-parameters and struct fields with `param`/`param_field`), map and data-table helpers.
 - `game.rs`: per-frame player state: world, controller, pawn, location, yaws, game screen open (`PalHUDService.IsAnyOverlayUIActive`), screen fading (`IsAnyFadeWidgetActive`, teleports, sleep, cutscenes), in base, inside a stage (`PalUtility.IsInsideStage`). The minimap hides for screens, fades and (optionally) the base.
-- `minimap.rs`: markers, culling, badges, chevrons, edge pins, zoom animation, icon scaling, the update loop. The biggest file.
+- `minimap.rs`: markers, culling, badges, chevrons, edge pins, zoom animation, icon scaling, the update loop. The biggest file. `standing()` decides which markers get a backing (`Backing`: disc for landmarks and death drops, colored diamonds for effigies, notes, skill fruit trees, supply drops and treasure maps), stay full size when zoomed out, and their layer.
 - `layers.rs`: everything inside the minimap box: shape strips, map and fog images, marker canvases, terrain tile canvases, rim, view cone, generated textures.
 - `terrain.rs`: rendered terrain tiles (below).
 - `markers.rs`, `actors.rs`, `objects.rs`, `icons.rs`: location markers, world actors, world-wide map object models, icon tables.

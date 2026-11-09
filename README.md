@@ -11,7 +11,8 @@ Made for Palworld v1.0.5 with the UE4SS build from the Palworld Steam Workshop (
 - Markers for fast travel points, bases, dungeons, towers, bosses, quests, warps, oil rigs, supply drops, treasure maps, death drops and pins.
 - Markers for wild, shiny and own pals, humans and other players, with pal portraits and an above or below arrow when they are on another level.
 - Markers for chests, eggs, effigies, notes, junk, ore, skill fruit trees, lotuses, forage, fishing spots and items lying on the ground. Every type can be switched on or off.
-- Landmarks (fast travel points, bases, dungeons, towers, bosses, quests and warps) stay readable when zoomed out, and the nearest ones off the minimap are pinned to its edge.
+- Landmarks (fast travel points, bases, dungeons, towers, bosses, quests and warps) stay readable when zoomed out, and the nearest ones off the minimap are pinned to its edge. Death drops get a red ring and the same treatment.
+- Effigies, notes, skill fruit trees, supply drops and treasure maps sit on colored diamonds (gold, white, purple and teal), stay full size when zoomed out and are drawn above pals and other markers.
 - Smooth zoom, icons that scale with zoom, a separate zoom for dungeons, and an optional auto zoom that widens the view while you move fast.
 - North-up or rotating with the camera, a view cone, any corner, any size, square to round.
 - Hides itself on game menus, during teleports and loading fades, and (optionally) inside your bases.
@@ -69,6 +70,6 @@ cmake --build build --config Game__Shipping__Win64 --target SimpleMiniMap
 
 `deps/RE-UE4SS` is a submodule pinned to the UE4SS build the Workshop package ships. A native mod has to be built against the UE4SS version the game runs, so when the Workshop UE4SS updates, the submodule needs to move to match.
 
-The build copies `main.dll` into the game's mod folder at the default Steam path. Close the game first, or the copy fails.
+The build copies `main.dll` into `Mods\SimpleMiniMap-dev` at the default Steam path, so it never overwrites an installed release. Set `SMM_DEPLOY_NAME` to change the folder name, and only keep one copy enabled at a time. Close the game first, or the copy fails.
 
 `shim/` is a small C++ layer over UE4SS, and `core/` holds the minimap itself, written in Rust.

@@ -9,7 +9,8 @@ Requires [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3625223587]
 [*]Markers for fast travel points, bases, dungeons, towers, bosses, quests, warps, oil rigs, supply drops, treasure maps, death drops and pins.
 [*]Markers for wild, shiny and own pals, humans and other players, with pal portraits and an above or below arrow when they are on another level.
 [*]Markers for chests, eggs, effigies, notes, junk, ore, skill fruit trees, lotuses, forage, fishing spots and items lying on the ground. Every type can be switched on or off.
-[*]Landmarks (fast travel points, bases, dungeons, towers, bosses, quests and warps) stay readable when zoomed out, and the nearest ones off the minimap are pinned to its edge.
+[*]Landmarks (fast travel points, bases, dungeons, towers, bosses, quests and warps) stay readable when zoomed out, and the nearest ones off the minimap are pinned to its edge. Death drops get a red ring and the same treatment.
+[*]Effigies, notes, skill fruit trees, supply drops and treasure maps sit on colored diamonds, stay full size when zoomed out and are drawn above pals and other markers.
 [*]Smooth zoom, icons that scale with zoom, a separate zoom for dungeons, and an optional auto zoom that widens the view while you move fast.
 [*]North-up or rotating with the camera, a view cone, any corner, any size, square to round.
 [*]Hides itself on game menus, during teleports and loading fades, and (optionally) inside your bases.

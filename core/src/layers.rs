@@ -146,16 +146,28 @@ fn cone_png() -> Option<Vec<u8>> {
 
 pub const BACKING_PIXELS: u32 = 64;
 
-/// A soft dark disc with a faint light edge, drawn behind landmark icons so they stand out on any ground.
-pub fn backing_png() -> Option<Vec<u8>> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackingShape {
+    Disc,
+    Diamond,
+}
+
+/// A soft dark disc or diamond with a thin edge in `rim` (sRGB and alpha), drawn behind important icons so they
+/// stand out on any ground and their kind reads at a glance.
+pub fn backing_png(shape: BackingShape, rim: [f64; 4]) -> Option<Vec<u8>> {
+    const DARK: [f64; 3] = [22.0, 26.0, 32.0];
     let half = f64::from(BACKING_PIXELS) / 2.0;
     let image = RgbaImage::from_fn(BACKING_PIXELS, BACKING_PIXELS, |x, y| {
-        let r = (f64::from(x) + 0.5 - half).hypot(f64::from(y) + 0.5 - half) / half;
-        let disc = ((1.0 - r) / 0.14).clamp(0.0, 1.0);
+        let (dx, dy) = (f64::from(x) + 0.5 - half, f64::from(y) + 0.5 - half);
+        let r = match shape {
+            BackingShape::Disc => dx.hypot(dy),
+            BackingShape::Diamond => dx.abs() + dy.abs(),
+        } / half;
+        let fill = ((1.0 - r) / 0.14).clamp(0.0, 1.0);
         let edge = (1.0 - ((r - 0.86).abs() / 0.05)).clamp(0.0, 1.0);
-        let shade = 22.0 + 210.0 * edge;
-        let alpha = (disc * 200.0).max(edge * 140.0);
-        Rgba([shade as u8, (shade + 4.0) as u8, (shade + 10.0) as u8, alpha as u8])
+        let channel = |index: usize| (DARK[index] + (rim[index] - DARK[index]) * edge) as u8;
+        let alpha = (fill * 200.0).max(edge * rim[3]);
+        Rgba([channel(0), channel(1), channel(2), alpha as u8])
     });
     encode(&image)
 }

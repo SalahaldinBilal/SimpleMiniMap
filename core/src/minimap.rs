@@ -9,7 +9,7 @@ use crate::game::Player;
 use crate::host;
 use crate::icons::{self, IconClassFinder, IconTable};
 use crate::keys::Keys;
-use crate::layers::{self, Layers};
+use crate::layers::{self, BackingShape, Layers};
 use crate::markers::Locations;
 use crate::menu::{Menu, MenuContent};
 use crate::objects::{MapObject, MapObjects};
@@ -76,12 +76,18 @@ const Z_OTHER: i32 = 4;
 const LOCAL_PLAYER_RADIUS: f64 = 400.0;
 // Inside a dungeon, markers further above or below the player than this belong to the overworld.
 const STAGE_HEIGHT: f64 = 5_000.0;
-const Z_LANDMARK_BACKING: i32 = 5;
-const Z_LANDMARK: i32 = 6;
+// Each backing goes one layer under its icon.
+const Z_IMPORTANT: i32 = 6;
+const Z_LANDMARK: i32 = 8;
 // The backing's width against a plain icon's. The game's icon widgets have empty padding around their picture,
-// so they get a tighter one.
+// so they get a tighter one. A diamond needs more room than a disc to fit the same icon inside.
 const BACKING_SIZE: f64 = 1.45;
 const GAME_ICON_BACKING_SIZE: f64 = 1.15;
+const DIAMOND_SIZE: f64 = 1.75;
+const GAME_ICON_DIAMOND_SIZE: f64 = 1.4;
+const DEATH_DROPS: [u8; 2] = [12, 13];
+const SUPPLY_DROP: u8 = 19;
+const TREASURE_MAP: u8 = 23;
 const Z_PIN: i32 = 11;
 const PIN_COUNT: usize = 2;
 const PIN_RANGE: f64 = 200_000.0;
@@ -525,8 +531,9 @@ struct Visual {
     half_height: f64,
     /// Render scale before the zoom's share: the game's icon widgets are drawn shrunk, images at 1.
     base_scale: f64,
-    landmark: bool,
-    /// The dark disc behind a landmark: its image and slot.
+    /// Landmarks and important markers keep their size when zoomed out.
+    full_size: bool,
+    /// The disc or diamond behind a landmark or important marker: its image and slot.
     backing: Option<(Weak, Weak)>,
     pending: Option<PendingTexture>,
 }
@@ -534,7 +541,71 @@ struct Visual {
 impl Visual {
     /// How much bigger than its setup this icon is drawn now. Landmarks never shrink with the zoom.
     fn factor(&self, look: IconLook) -> f64 {
-        if self.landmark { look.zoom.max(1.0) * look.landmark } else { look.zoom }
+        if self.full_size { look.zoom.max(1.0) * look.landmark } else { look.zoom }
+    }
+}
+
+/// What sits behind a landmark or important marker. Each kind has its own shape and rim color, so it reads at a
+/// glance like a pal's badge does.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Backing {
+    Landmark,
+    DeathDrop,
+    Effigy,
+    Note,
+    SkillFruit,
+    Supply,
+}
+
+impl Backing {
+    const ALL: [Backing; 6] = [Backing::Landmark, Backing::DeathDrop, Backing::Effigy, Backing::Note, Backing::SkillFruit, Backing::Supply];
+
+    fn shape(self) -> BackingShape {
+        match self {
+            Backing::Landmark | Backing::DeathDrop => BackingShape::Disc,
+            _ => BackingShape::Diamond,
+        }
+    }
+
+    /// The rim in sRGB, and its opacity.
+    fn rim(self) -> [f64; 4] {
+        match self {
+            Backing::Landmark => [232.0, 236.0, 242.0, 140.0],
+            Backing::DeathDrop => [235.0, 70.0, 60.0, 255.0],
+            Backing::Effigy => [245.0, 195.0, 70.0, 255.0],
+            Backing::Note => [240.0, 240.0, 240.0, 255.0],
+            Backing::SkillFruit => [190.0, 110.0, 240.0, 255.0],
+            Backing::Supply => [70.0, 215.0, 210.0, 255.0],
+        }
+    }
+
+    fn size(self, game_icon: bool) -> f64 {
+        match (self.shape(), game_icon) {
+            (BackingShape::Disc, false) => BACKING_SIZE,
+            (BackingShape::Disc, true) => GAME_ICON_BACKING_SIZE,
+            (BackingShape::Diamond, false) => DIAMOND_SIZE,
+            (BackingShape::Diamond, true) => GAME_ICON_DIAMOND_SIZE,
+        }
+    }
+
+    /// Landmark discs follow the backing setting. Diamonds are what marks their kind, so they always show.
+    fn shown(self, settings: &Settings) -> bool {
+        self.shape() == BackingShape::Diamond || settings.landmark_backing
+    }
+}
+
+/// Markers drawn above the rest, at full size when zoomed out, with a backing: landmarks and death drops on top,
+/// then effigies, notes, skill fruit trees, supply drops and treasure maps. Its backing and its layer.
+fn standing(view: &MarkerView) -> Option<(Backing, i32)> {
+    let location = matches!(view.key, MarkerKey::Location(_));
+    match view.kind {
+        kind if location && DEATH_DROPS.contains(&kind) => Some((Backing::DeathDrop, Z_LANDMARK)),
+        _ if is_landmark(view) => Some((Backing::Landmark, Z_LANDMARK)),
+        SUPPLY_DROP | TREASURE_MAP if location => Some((Backing::Supply, Z_IMPORTANT)),
+        actors::EFFIGY => Some((Backing::Effigy, Z_IMPORTANT)),
+        actors::NOTE => Some((Backing::Note, Z_IMPORTANT)),
+        actors::SKILL_FRUIT => Some((Backing::SkillFruit, Z_IMPORTANT)),
+        _ => None,
     }
 }
 
@@ -642,7 +713,7 @@ struct Live {
     /// The zoom's share of every icon's scale, and the landmark size, as last applied.
     icon_zoom: f64,
     landmark_scale: f64,
-    backing_texture: Option<Weak>,
+    backing_textures: HashMap<Backing, Weak>,
     pins: Vec<EdgePin>,
     cone: Option<(bool, f32)>,
     region: &'static Region,
@@ -1172,7 +1243,7 @@ fn create_visual(
                 game_icon: true,
                 half_height: size / 2.0,
                 base_scale: scale,
-                landmark: false,
+                full_size: false,
                 backing: None,
                 pending: None,
             }))
@@ -1193,7 +1264,7 @@ fn create_visual(
                 game_icon: false,
                 half_height: size / 2.0,
                 base_scale: 1.0,
-                landmark: false,
+                full_size: false,
                 backing: None,
                 pending: None,
             }))
@@ -1240,7 +1311,7 @@ fn create_visual(
                 game_icon: true,
                 half_height: size / 2.0,
                 base_scale: scale,
-                landmark: false,
+                full_size: false,
                 backing: None,
                 pending: None,
             }))
@@ -1271,7 +1342,7 @@ fn badge_visual(
         game_icon: false,
         half_height: badge_size / 2.0,
         base_scale: 1.0,
-        landmark: false,
+        full_size: false,
         backing: None,
         pending,
     };
@@ -1508,9 +1579,10 @@ fn cull_one(
                 if let (true, Some(widget)) = (live.icon_angle != 0.0, visual.widget.get()) {
                     ui.set_angle.call(widget, |a| a.set(0, live.icon_angle));
                 }
-                visual.landmark = is_landmark(view);
-                if visual.landmark && context.settings.landmark_backing {
-                    visual.backing = make_backing(ui, live, view, context.settings, visual.game_icon);
+                let standing = standing(view);
+                visual.full_size = standing.is_some();
+                if let Some((backing, z)) = standing.filter(|(backing, _)| backing.shown(context.settings)) {
+                    visual.backing = make_backing(ui, live, view, context.settings, visual.game_icon, backing, z - 1);
                 }
                 view.visual = Some(visual);
                 scale_marker(ui, view, live.icon_look());
@@ -1558,16 +1630,16 @@ fn cull_one(
 }
 
 /// Which marker layer an icon goes on (over the fog, or under it so unexplored areas cover it) and its order
-/// there: pals at the bottom, then shiny pals, boss pals and every other marker. The game keeps a few markers
-/// over its fog, and with markers shown in unexplored areas everything goes over it.
+/// there: pals at the bottom, then shiny pals, boss pals, every other marker, important markers and landmarks.
+/// The game keeps a few markers over its fog, and with markers shown in unexplored areas everything goes over it.
 fn marker_place(view: &MarkerView, settings: &Settings) -> (bool, i32) {
-    let z = match &view.look {
-        _ if is_landmark(view) => Z_LANDMARK,
-        Look::Character(key) if key.boss => Z_BOSS_PAL,
-        Look::Character(key) if key.shiny => Z_SHINY_PAL,
-        Look::Character(_) => Z_PAL,
-        Look::Boss(_) => Z_BOSS_PAL,
-        _ => Z_OTHER,
+    let z = match (standing(view), &view.look) {
+        (Some((_, z)), _) => z,
+        (None, Look::Character(key)) if key.boss => Z_BOSS_PAL,
+        (None, Look::Character(key)) if key.shiny => Z_SHINY_PAL,
+        (None, Look::Character(_)) => Z_PAL,
+        (None, Look::Boss(_)) => Z_BOSS_PAL,
+        (None, _) => Z_OTHER,
     };
     (settings.markers_in_fog || view.above_fog, z)
 }
@@ -1587,13 +1659,21 @@ fn place_icon(ui: &mut Ui, view: &mut MarkerView, slot: Obj, at: Vec2, tolerance
     place_elevation(ui, view, look);
 }
 
-/// The dark disc behind a landmark icon, one layer under it.
-fn make_backing(ui: &mut Ui, live: &Live, view: &MarkerView, settings: &Settings, game_icon: bool) -> Option<(Weak, Weak)> {
-    let texture = live.backing_texture.and_then(Weak::get)?;
+/// The disc or diamond behind a landmark or important icon, at layer `z`, one under the icon.
+fn make_backing(
+    ui: &mut Ui,
+    live: &Live,
+    view: &MarkerView,
+    settings: &Settings,
+    game_icon: bool,
+    backing: Backing,
+    z: i32,
+) -> Option<(Weak, Weak)> {
+    let texture = live.backing_textures.get(&backing).and_then(|texture| texture.get())?;
     let (over_fog, _) = marker_place(view, settings);
     let (tree, layer) = (live.tree.get()?, live.layers.canvas(over_fog)?);
-    let size = IMAGE_ICON_SIZE * settings.icon_scale * if game_icon { GAME_ICON_BACKING_SIZE } else { BACKING_SIZE };
-    let (image, slot) = ui.image(tree, layer, Vec2::default(), Vec2 { x: size, y: size }, Z_LANDMARK_BACKING).ok()?;
+    let size = IMAGE_ICON_SIZE * settings.icon_scale * backing.size(game_icon);
+    let (image, slot) = ui.image(tree, layer, Vec2::default(), Vec2 { x: size, y: size }, z).ok()?;
     ui.center(slot);
     ui.set_texture(image, texture);
     ui.set_shown(image, false);
@@ -2424,10 +2504,14 @@ impl Minimap {
         }
         let layer_size = region.image_size(size, view_units);
         let mut layers = Layers::build(w, world, tree, frame, size, settings.roundness, map_texture, fog_material, layer_size)?;
-        let backing_texture = layers::backing_png().and_then(|png| w.import_png(world, &png));
-        // Images only hold it while a landmark is drawn, so it is kept like a terrain tile.
-        if let Some(texture) = backing_texture {
+        let mut backing_textures = HashMap::new();
+        for backing in Backing::ALL {
+            let Some(texture) = layers::backing_png(backing.shape(), backing.rim()).and_then(|png| w.import_png(world, &png)) else {
+                continue;
+            };
+            // Images only hold it while such a marker is drawn, so it is kept like a terrain tile.
             layers.hold(w, texture);
+            backing_textures.insert(backing, Weak::new(texture));
         }
         let pin_arrow = layers::pin_arrow_png().and_then(|png| w.import_png(world, &png));
         let pins = (0..PIN_COUNT)
@@ -2458,7 +2542,7 @@ impl Minimap {
             icon_angle: 0.0,
             icon_zoom: 1.0,
             landmark_scale: 1.0,
-            backing_texture: backing_texture.map(Weak::new),
+            backing_textures,
             pins,
             cone: None,
             view_units,
