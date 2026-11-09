@@ -25,7 +25,7 @@ cmake -S . -B build -G "Visual Studio 17 2022"
 cmake --build build --config Game__Shipping__Win64 --target SimpleMiniMap
 ```
 
-The build runs `cargo build --release` for `core/`, links it into `main.dll` and copies it to `C:\Program Files (x86)\Steam\steamapps\common\Palworld\Mods\NativeMods\UE4SS\Mods\SimpleMiniMap\dlls\main.dll`. The copy fails while the game is running ("Error copying file"). The build itself still succeeded, so tell the user to close the game and deploy again.
+The build runs `cargo build --release` for `core/`, links it into `main.dll` and copies it to `C:\Program Files (x86)\Steam\steamapps\common\Palworld\Mods\NativeMods\UE4SS\Mods\SimpleMiniMap-dev\dlls\main.dll` (with `enabled.txt`), so a released copy in `Mods\SimpleMiniMap` is left alone. `SMM_DEPLOY_NAME` sets the folder name. The copy fails while the game is running ("Error copying file"). The build itself still succeeded, so tell the user to close the game and deploy again.
 
 Changing the host interface: `SMM_HOST_API_VERSION` in `smm_host.h` and `API_VERSION` in `core/src/host.rs` must match, and the field order of `SmmHostApi` must match `HostApi` exactly. Remove host functions that end up unused.
 
@@ -34,7 +34,7 @@ Changing the host interface: `SMM_HOST_API_VERSION` in `smm_host.h` and `API_VER
 - Log: `...\Palworld\Mods\NativeMods\UE4SS\UE4SS.log`, lines tagged `[SimpleMiniMap]`. Every 10 s: `frame budget: N fps, our cost X us average, Y us worst` and a timing tree (`profile.rs`). Time new work with `profile::time("name", || ...)` or `profile::scope("name")`.
 - SDK dump: `...\Palworld\Mods\NativeMods\UE4SS\CXXHeaderDump\` (`Pal.hpp`, `Engine.hpp`, `Engine_enums.hpp`, `UMG.hpp`, `PPSkyCreatorPlugin.hpp`, `WBP_*.hpp`). A function is declared on one class: resolve it on that class or a subclass, never on a base class.
 - Screenshots: ffmpeg is installed. Crop and enlarge regions (`crop=...,scale=...:flags=neighbor`) into the scratchpad to inspect edges. No Python imaging library.
-- User settings: `...\Mods\SimpleMiniMap\settings.ini`.
+- User settings: `...\Mods\SimpleMiniMap-dev\settings.ini` for the dev build (each mod folder has its own settings and cache).
 
 ## Architecture of `core/`
 
@@ -72,7 +72,8 @@ Changing the host interface: `SMM_HOST_API_VERSION` in `smm_host.h` and `API_VER
 - Settings: `OverworldTerrain` and `DungeonTerrain`, each `Off`, `On` or `Close` (400 m or less across). Dungeon tiles use 10 m height bands with the camera just above the band, so roofs drop out, and are dropped on each new entry.
 - Survey before each capture: 5 by 5 rays down across the tile. All must hit (the ground is streamed in), and the surface camera goes 30 m plus 4% of the tile width over the highest hit, so nothing is cut off.
 - Fixed lighting, so tiles match at any time of day. During each capture only: the sky actor (`APPSkyCreator`) sun, moon and sky light are set to intensity 0 (fast update, no shadow rebuild), its volumetric clouds and height fog are hidden, its weather particles are excluded, and two map lights on the pawn are shown (key from the north-west at 50 degrees, fill from above at 60%, no shadows). Exposure is manual, Lumen GI and reflections are off. Once per world the map lights are calibrated from one readback so the ground lands at a normal brightness.
-- Capture source `SCS_SceneColorSceneDepth`, the only lit source whose alpha comes out opaque.
+- Capture source `SCS_SceneColorSceneDepth`, the only lit source whose alpha comes out opaque. It is taken before the tonemapper, so post process color grading does nothing to tiles.
+- Map look (`MapStyle`), fitted to the game's map art from screenshot samples: the map lights are tinted linear (0.4, 0.5, 1.0), and each tile then gets the curve `x(1 + 8x) / 3.4` with canvas draws (float scratch target, Opaque, Modulate, Additive, copied back). No readback. Setting `TerrainMapColors` (on by default). Switching it drops all tiles, recolors the lights and recalibrates.
 - Known limits, not bugs to chase:
   - UE 5.1 orthographic views have no real camera position (view origin W = 0), so anything measured from the camera (foliage cull distances, distance fades) is measured from the world origin. Switching foliage culling off per capture was tried and removed: it cost 3 to 6 ms per capture, and grass blades are vertical cards that are edge-on from straight above anyway, so it only added dark bush blobs.
   - Cliff and hill meshes (`M_PalLit_Top`) look flat from above: their top grass texture is a small tiling pattern that blurs at 0.5 m per pixel, while the landscape's texture stays busy. Higher tile resolution is the only lever.

@@ -52,6 +52,7 @@ enum Toggle {
     LandmarkBacking,
     EdgePins,
     FogOfWar,
+    MapColors,
     Category(usize),
     Pickup(usize),
 }
@@ -134,6 +135,7 @@ impl Toggle {
             Toggle::LandmarkBacking => settings.landmark_backing,
             Toggle::EdgePins => settings.edge_pins,
             Toggle::FogOfWar => settings.fog_of_war,
+            Toggle::MapColors => settings.map_colors,
             Toggle::Category(index) => settings.categories[index],
             Toggle::Pickup(index) => settings.pickups.get(index).is_some_and(|(_, shown)| *shown),
         }
@@ -152,6 +154,7 @@ impl Toggle {
             Toggle::LandmarkBacking => settings.landmark_backing = on,
             Toggle::EdgePins => settings.edge_pins = on,
             Toggle::FogOfWar => settings.fog_of_war = on,
+            Toggle::MapColors => settings.map_colors = on,
             Toggle::Category(index) => settings.categories[index] = on,
             Toggle::Pickup(index) => {
                 if let Some(entry) = settings.pickups.get_mut(index) {
@@ -749,7 +752,9 @@ impl Menu {
         add_slider(w, &mut window, tree, page, 0, "Megazoom range", Number::Megazoom, settings)?;
         add_switch(w, &mut window, tree, page, 0, "Hide while in your base", Toggle::HideInBase, None)?;
         add_cycle(w, &mut window, tree, page, 0, "Rendered terrain in the overworld", Cycle::OverworldTerrain)?;
-        add_cycle(w, &mut window, tree, page, 0, "Rendered terrain in dungeons", Cycle::DungeonTerrain)?;        add_switch(w, &mut window, tree, page, 0, "Clouds over unexplored areas", Toggle::FogOfWar, None)?;
+        add_cycle(w, &mut window, tree, page, 0, "Rendered terrain in dungeons", Cycle::DungeonTerrain)?;
+        add_switch(w, &mut window, tree, page, 0, "Color terrain like the game's map", Toggle::MapColors, None)?;
+        add_switch(w, &mut window, tree, page, 0, "Clouds over unexplored areas", Toggle::FogOfWar, None)?;
         add_switch(w, &mut window, tree, page, 0, "Show markers in unexplored areas", Toggle::MarkersInFog, None)?;
 
         // Markers tab: one card per group.

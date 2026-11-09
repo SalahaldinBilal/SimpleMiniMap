@@ -5,7 +5,7 @@ Requires [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3625223587]
 [h2]Features[/h2]
 [list]
 [*]A corner minimap that uses the game's own map, its explored-area clouds and its icons.
-[*]Rendered terrain: the ground around you is captured from above once per area and kept, so it is far more detailed than the map art. It works in the overworld and in dungeons, where roofs are left out so you can see the rooms.
+[*]Rendered terrain: the ground around you is captured from above once per area and kept, so it is far more detailed than the map art. It works in the overworld and in dungeons, where roofs are left out so you can see the rooms. By default it is colored to look like the game's own map.
 [*]Markers for fast travel points, bases, dungeons, towers, bosses, quests, warps, oil rigs, supply drops, treasure maps, death drops and pins.
 [*]Markers for wild, shiny and own pals, humans and other players, with pal portraits and an above or below arrow when they are on another level.
 [*]Markers for chests, eggs, effigies, notes, junk, ore, skill fruit trees, lotuses, forage, fishing spots and items lying on the ground. Every type can be switched on or off.

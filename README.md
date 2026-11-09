@@ -47,6 +47,7 @@ Most settings are in the window that Alt+J opens, and they save as you change th
 Some defaults worth knowing:
 
 - Rendered terrain is on in the overworld and in dungeons. Each one can be set to Off, On, or "When zoomed in close" (400 m or less across).
+- Rendered terrain is colored to look like the game's own map. Turn off "Color terrain like the game's map" for its natural colors.
 - The view is 220 m across, and 120 m in dungeons.
 - Respawn points and your own pals are hidden. So are very common pickups (wood, stone, small pal crystals, berries, eggs, arrows, leather and wool).
 - The minimap hides inside your bases.

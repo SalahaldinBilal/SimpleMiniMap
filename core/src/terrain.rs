@@ -57,9 +57,19 @@ const CALIBRATION_TARGET: f32 = 0.2;
 const CALIBRATION_ROUNDS: u32 = 4;
 const CLIPPED: f32 = 0.95;
 
+// Fitted to the game's map art: the map lights' color, then the curve x(1 + 8x) / 3.4 on each captured tile.
+const MAP_LIGHT_COLOR: LinearColor = LinearColor { r: 0.4, g: 0.5, b: 1.0, a: 1.0 };
+const NATURAL_LIGHT_COLOR: LinearColor = LinearColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+const CURVE_SQUARE: f32 = 8.0 / 3.4;
+const CURVE_LINEAR: f32 = 1.0 / 3.4;
+
 const SCENE_COLOR_SCENE_DEPTH: u8 = 3;
 const ORTHOGRAPHIC: u8 = 1;
 const RGBA8_SRGB: u8 = 3;
+const RGBA16F: u8 = 6;
+const BLEND_OPAQUE: u8 = 0;
+const BLEND_ADDITIVE: u8 = 3;
+const BLEND_MODULATE: u8 = 4;
 const AUTO_EXPOSURE_MANUAL: u8 = 2;
 const GLOBAL_ILLUMINATION_NONE: u8 = 0;
 const REFLECTIONS_NONE: u8 = 0;
@@ -170,6 +180,82 @@ struct Ground {
     highest: f64,
 }
 
+/// The look fitted to the game's map art: a tinted map light, and a contrast curve drawn over each tile on the GPU.
+struct MapStyle {
+    set_light_color: Function,
+    begin_draw: Function,
+    end_draw: Function,
+    draw_texture: Function,
+    target_gamma_offset: usize,
+    /// A float target for the curve, so nothing clips between its steps, and the widget holding it.
+    scratch: Option<(Weak, Weak)>,
+    broken: bool,
+}
+
+impl MapStyle {
+    fn new(rendering: Obj, light_class: Obj) -> Result<Self, String> {
+        let canvas = ue::find("/Script/Engine.Canvas")?;
+        Ok(Self {
+            set_light_color: Function::resolve(light_class, "SetLightColor", &["NewLightColor", "bSRGB"])?,
+            begin_draw: Function::resolve(
+                rendering,
+                "BeginDrawCanvasToRenderTarget",
+                &["WorldContextObject", "TextureRenderTarget", "Canvas", "Size", "Context"],
+            )?,
+            end_draw: Function::resolve(rendering, "EndDrawCanvasToRenderTarget", &["WorldContextObject", "Context"])?,
+            draw_texture: Function::resolve(
+                canvas,
+                "K2_DrawTexture",
+                &[
+                    "RenderTexture",
+                    "ScreenPosition",
+                    "ScreenSize",
+                    "CoordinatePosition",
+                    "CoordinateSize",
+                    "RenderColor",
+                    "BlendMode",
+                    "Rotation",
+                    "PivotPoint",
+                ],
+            )?,
+            target_gamma_offset: ue::property_offset(ue::find("/Script/Engine.TextureRenderTarget")?, "TargetGamma")?,
+            scratch: None,
+            broken: false,
+        })
+    }
+
+    /// Draws each texture over the whole of `target`, scaled by a brightness, with a blend mode.
+    fn draw(&mut self, rendering: Obj, world: Obj, target: Obj, passes: &[(Obj, f32, u8)]) -> Result<(), String> {
+        self.begin_draw.call(rendering, |a| {
+            a.set_obj(0, Some(world));
+            a.set_obj(1, Some(target));
+        });
+        let canvas = Obj::from_raw(self.begin_draw.param::<*mut c_void>(2));
+        let context = self.begin_draw.param_bytes(4, 16);
+        if let Some(canvas) = canvas {
+            let size = f64::from(TILE_PIXELS);
+            for &(texture, scale, blend) in passes {
+                self.draw_texture.call(canvas, |a| {
+                    a.set_obj(0, Some(texture));
+                    a.set(1, Vec2::default());
+                    a.set(2, Vec2 { x: size, y: size });
+                    a.set(3, Vec2::default());
+                    a.set(4, Vec2 { x: 1.0, y: 1.0 });
+                    a.set(5, LinearColor { r: scale, g: scale, b: scale, a: 1.0 });
+                    a.set(6, blend);
+                    a.set(7, 0.0f32);
+                    a.set(8, Vec2 { x: 0.5, y: 0.5 });
+                });
+            }
+        }
+        self.end_draw.call(rendering, |a| {
+            a.set_obj(0, Some(world));
+            a.set_bytes(1, &context);
+        });
+        canvas.map(|_| ()).ok_or_else(|| "BeginDrawCanvasToRenderTarget gave no canvas".to_string())
+    }
+}
+
 struct Tile {
     texture: Weak,
     holder: Weak,
@@ -216,6 +302,9 @@ pub struct Terrain {
     intensity_offset: usize,
     impact_offset: usize,
     sky: Option<Sky>,
+    style: Option<MapStyle>,
+    /// Whether the kept tiles and the map lights have the map look, once known.
+    styled: Option<bool>,
     source_offset: usize,
     projection_offset: usize,
     ortho_offset: usize,
@@ -275,6 +364,9 @@ impl Terrain {
             host::warning(&format!("lit terrain cannot leave out the game's sky: {reason}"));
         }
         let post_process = ue::find("/Script/Engine.PostProcessSettings")?;
+        let style = MapStyle::new(rendering, light_class)
+            .inspect_err(|reason| host::warning(&format!("terrain tiles keep their natural colors: {reason}")))
+            .ok();
         let now = Instant::now();
         Ok(Self {
             actor_of_class: Function::resolve(statics, "GetActorOfClass", &["WorldContextObject", "actorClass"])?,
@@ -295,6 +387,8 @@ impl Terrain {
             statics,
             post_process,
             sky: None,
+            style,
+            styled: None,
             add_component: Function::resolve(
                 actor,
                 "AddComponentByClass",
@@ -374,6 +468,9 @@ impl Terrain {
         self.calibration = CALIBRATION_START;
         self.scratch = None;
         self.sky = None;
+        if let Some(style) = &mut self.style {
+            style.scratch = None;
+        }
         self.failures = 0;
         self.broken = false;
         self.outside = false;
@@ -396,6 +493,15 @@ impl Terrain {
         }
         self.next_check = now + CHECK_EVERY;
         self.region_name = region.name;
+
+        let styled = settings.map_colors && self.style.as_ref().is_some_and(|style| !style.broken);
+        if self.styled.replace(styled).is_some_and(|before| before != styled) {
+            // The kept tiles have the other look, and the light's brightness was fitted for its other color.
+            self.drop_tiles(w, layers, |_| true);
+            self.calibration = CALIBRATION_START;
+            self.color_map_lights();
+            host::info(if styled { "terrain colored like the game's map" } else { "terrain in natural colors" });
+        }
 
         let at = player.location;
         if self.last_position.is_some_and(|before| (at.x - before.x).hypot(at.y - before.y) > JUMP) {
@@ -764,7 +870,25 @@ impl Terrain {
             a.set(2, false);
             a.set(4, true);
         });
+        self.color_light(light);
         Ok(light)
+    }
+
+    fn color_light(&mut self, light: Obj) {
+        let color = if self.styled == Some(true) { MAP_LIGHT_COLOR } else { NATURAL_LIGHT_COLOR };
+        if let Some(style) = &mut self.style {
+            style.set_light_color.call(light, |a| {
+                a.set(0, color);
+                a.set(1, true);
+            });
+        }
+    }
+
+    fn color_map_lights(&mut self) {
+        let Some((lights, _)) = self.map_lights else { return };
+        for light in lights.into_iter().filter_map(Weak::get) {
+            self.color_light(light);
+        }
     }
 
     /// Leaves the game's sky out of one capture and switches the map light on. This runs after the frame's own
@@ -854,7 +978,7 @@ impl Terrain {
         self.sky.unwrap_or_default()
     }
 
-    fn new_target(&mut self, world: Obj) -> Result<Obj, String> {
+    fn new_target(&mut self, world: Obj, format: u8) -> Result<Obj, String> {
         let rendering = self.rendering;
         let raw: *mut c_void = self
             .create_target
@@ -862,12 +986,17 @@ impl Terrain {
                 a.set_obj(0, Some(world));
                 a.set(1, TILE_PIXELS);
                 a.set(2, TILE_PIXELS);
-                a.set(3, RGBA8_SRGB);
+                a.set(3, format);
                 a.set(4, BLACK);
                 a.set(5, false);
             })
             .returned();
-        Obj::from_raw(raw).ok_or_else(|| "CreateRenderTarget2D made no render target".to_string())
+        let target = Obj::from_raw(raw).ok_or_else(|| "CreateRenderTarget2D made no render target".to_string())?;
+        if let Some(style) = &self.style {
+            // Canvas draws stay in linear light, so the curve means what it says.
+            unsafe { target.write(style.target_gamma_offset, 1.0f32) };
+        }
+        Ok(target)
     }
 
     /// Where calibration captures land. The capture holds on to it while it is its target.
@@ -875,9 +1004,35 @@ impl Terrain {
         if let Some(scratch) = self.scratch.and_then(Weak::get) {
             return Ok(scratch);
         }
-        let scratch = self.new_target(world)?;
+        let scratch = self.new_target(world, RGBA8_SRGB)?;
         self.scratch = Some(Weak::new(scratch));
         Ok(scratch)
+    }
+
+    /// The contrast curve over a captured tile, all on the GPU: scratch = a·T² + b·T, then copied back over it.
+    fn grade(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj, tile: Obj) -> Result<(), String> {
+        let Some(style) = self.style.as_ref().filter(|_| self.styled == Some(true)) else { return Ok(()) };
+        let kept = style.scratch.and_then(|(target, holder)| holder.get().and(target.get()));
+        let scratch = match kept {
+            Some(scratch) => scratch,
+            None => {
+                let scratch = self.new_target(world, RGBA16F)?;
+                let holder = layers.hold(w, scratch).ok_or("the minimap has nowhere to keep the grading target")?;
+                if let Some(style) = &mut self.style {
+                    style.scratch = Some((Weak::new(scratch), holder));
+                }
+                scratch
+            }
+        };
+        let rendering = self.rendering;
+        let Some(style) = &mut self.style else { return Ok(()) };
+        style.draw(
+            rendering,
+            world,
+            scratch,
+            &[(tile, CURVE_SQUARE, BLEND_OPAQUE), (tile, 1.0, BLEND_MODULATE), (tile, CURVE_LINEAR, BLEND_ADDITIVE)],
+        )?;
+        style.draw(rendering, world, tile, &[(scratch, 1.0, BLEND_OPAQUE)])
     }
 
     /// Renders one tile's square from above into `into`. On the surface the camera goes just over the tile's
@@ -960,7 +1115,7 @@ impl Terrain {
     fn capture_tile(&mut self, w: &mut Widgets, layers: &mut Layers, player: &Player, key: TileKey, ground: Ground) -> Result<(), String> {
         let started = Instant::now();
         let world = player.world;
-        let target = self.new_target(world)?;
+        let target = self.new_target(world, RGBA8_SRGB)?;
         let holder = layers.hold(w, target).ok_or("the minimap has nowhere to keep the tile")?;
         let camera_height = match self.render(player, key, ground, target) {
             Ok(height) => height,
@@ -969,6 +1124,12 @@ impl Terrain {
                 return Err(reason);
             }
         };
+        if let Err(reason) = profile::time("terrain grade", || self.grade(w, layers, world, target)) {
+            host::warning(&format!("terrain tiles keep their natural colors from here on: {reason}"));
+            if let Some(style) = &mut self.style {
+                style.broken = true;
+            }
+        }
 
         self.tiles.insert(key, Tile { texture: Weak::new(target), holder, outside: self.outside, last_seen: Instant::now() });
         self.evict(w, layers);
