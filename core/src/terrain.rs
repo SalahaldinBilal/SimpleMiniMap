@@ -34,12 +34,14 @@ const VIEW_DISTANCE_MARGIN: f64 = 10_000.0;
 const CHECK_EVERY: Duration = Duration::from_millis(250);
 const CAPTURE_GAP: Duration = Duration::from_millis(750);
 const SETTLE: Duration = Duration::from_secs(2);
+// After a load, a teleport or a dungeon entry the game keeps streaming the area in for a while, and a capture can
+// miss ground that is not drawn yet. Tiles captured this soon after are captured once more later.
+const WARMUP: Duration = Duration::from_secs(12);
 const JUMP: f64 = 10_000.0;
 const MAX_FAILURES: u32 = 3;
 // Tiles surveyed per update, at 25 rays each.
 const LOAD_CHECKS_PER_TICK: usize = 2;
 const LOAD_CHECK_REACH: f64 = 200_000.0;
-
 // The light lit tiles are drawn with instead of the game's sun, moon and sky: always the same, so tiles made at
 // any time of day match. It comes from the north-west and high, the usual direction for shaded relief maps.
 const MAP_LIGHT_ROTATION: Rotator = Rotator { pitch: -50.0, yaw: 135.0, roll: 0.0 };
@@ -62,6 +64,19 @@ const MAP_LIGHT_COLOR: LinearColor = LinearColor { r: 0.4, g: 0.5, b: 1.0, a: 1.
 const NATURAL_LIGHT_COLOR: LinearColor = LinearColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 const CURVE_SQUARE: f32 = 8.0 / 3.4;
 const CURVE_LINEAR: f32 = 1.0 / 3.4;
+// Water is found by capturing the tile again with it hidden: wherever the two differ by more than 1/50, it is
+// painted the game's map water color, fading out where shallow water barely changes the ground under it.
+const WATER_MASK_GAIN: f32 = 50.0;
+// The mask is blurred this many pixels each way, so shores fade over a few metres like the game's map, and the
+// fading band gets the lighter shallow color.
+const SHORE_BLUR_PIXELS: i32 = 3;
+const WATER_COLOR: LinearColor = LinearColor { r: 0.0056, g: 0.091, b: 0.122, a: 1.0 };
+const SHALLOW_WATER_COLOR: LinearColor = LinearColor { r: 0.0097, g: 0.156, b: 0.223, a: 1.0 };
+const TEXTURE_CLAMP: u8 = 1;
+const WATER_CLASSES: [&str; 2] = ["/Script/Water.WaterBody", "/Script/Water.WaterZone"];
+const SIMPLE_WATER_CLASS: &str = "BP_SimpleWater_C";
+const SIMPLE_WATER_TRIES: u32 = 3;
+const SIMPLE_WATER_RETRY: Duration = Duration::from_secs(30);
 
 const SCENE_COLOR_SCENE_DEPTH: u8 = 3;
 const ORTHOGRAPHIC: u8 = 1;
@@ -187,15 +202,92 @@ struct MapStyle {
     end_draw: Function,
     draw_texture: Function,
     target_gamma_offset: usize,
-    /// A float target for the curve, so nothing clips between its steps, and the widget holding it.
+    address_offsets: [usize; 2],
+    resize_target: Function,
+    clear_target: Function,
+    clear_hidden: Function,
+    all_actors: Function,
+    /// The Water plugin's classes, when the game has them loaded.
+    water_classes: Vec<Obj>,
+    /// The game's own water class, a Blueprint, looked up once it is loaded.
+    simple_water: Option<Weak>,
+    simple_water_tries: u32,
+    next_simple_water_try: Instant,
+    water_report: String,
+    /// A float target, so nothing clips between steps, and the widget holding it.
     scratch: Option<(Weak, Weak)>,
+    /// The capture with water hidden, later the water mask, and the widget holding it.
+    dry: Option<(Weak, Weak)>,
+    /// The water mask squared, and the widget holding it.
+    squared: Option<(Weak, Weak)>,
     broken: bool,
 }
 
+/// The targets the map look works in.
+#[derive(Clone, Copy)]
+enum Held {
+    Scratch,
+    Dry,
+    Squared,
+}
+
+const fn gray(value: f32) -> LinearColor {
+    LinearColor { r: value, g: value, b: value, a: 1.0 }
+}
+
+fn add(a: LinearColor, b: LinearColor, scale: f32) -> LinearColor {
+    LinearColor { r: a.r + b.r * scale, g: a.g + b.g * scale, b: a.b + b.b * scale, a: 1.0 }
+}
+
+/// One canvas draw: a texture over the whole target, multiplied by a color, with a blend mode, its
+/// texture read shifted by some pixels.
+#[derive(Clone, Copy)]
+struct Pass {
+    texture: Obj,
+    color: LinearColor,
+    blend: u8,
+    shift: Vec2,
+}
+
+fn pass(texture: Obj, color: LinearColor, blend: u8) -> Pass {
+    Pass { texture, color, blend, shift: Vec2::default() }
+}
+
+/// A box blur along one axis: the first tap replaces what is in the target, the rest add to it.
+fn blur_passes(texture: Obj, horizontal: bool) -> Vec<Pass> {
+    let weight = gray(1.0 / (2 * SHORE_BLUR_PIXELS + 1) as f32);
+    (-SHORE_BLUR_PIXELS..=SHORE_BLUR_PIXELS)
+        .enumerate()
+        .map(|(index, offset)| {
+            let step = f64::from(offset);
+            Pass {
+                texture,
+                color: weight,
+                blend: if index == 0 { BLEND_OPAQUE } else { BLEND_ADDITIVE },
+                shift: if horizontal { Vec2 { x: step, y: 0.0 } } else { Vec2 { x: 0.0, y: step } },
+            }
+        })
+        .collect()
+}
+
 impl MapStyle {
-    fn new(rendering: Obj, light_class: Obj) -> Result<Self, String> {
+    fn new(rendering: Obj, light_class: Obj, capture_base: Obj, statics: Obj) -> Result<Self, String> {
         let canvas = ue::find("/Script/Engine.Canvas")?;
+        let water_classes: Vec<Obj> = WATER_CLASSES.iter().filter_map(|path| ue::find(path).ok()).collect();
+        let target_class = ue::find("/Script/Engine.TextureRenderTarget2D")?;
         Ok(Self {
+            address_offsets: [ue::property_offset(target_class, "AddressX")?, ue::property_offset(target_class, "AddressY")?],
+            resize_target: Function::resolve(rendering, "ResizeRenderTarget2D", &["TextureRenderTarget", "Width", "Height"])?,
+            squared: None,
+            clear_target: Function::resolve(rendering, "ClearRenderTarget2D", &["WorldContextObject", "TextureRenderTarget", "ClearColor"])?,
+            clear_hidden: Function::resolve(capture_base, "ClearHiddenComponents", &[])?,
+            all_actors: Function::resolve(statics, "GetAllActorsOfClass", &["WorldContextObject", "actorClass", "OutActors"])?,
+            water_classes,
+            simple_water: None,
+            simple_water_tries: 0,
+            next_simple_water_try: Instant::now(),
+            water_report: String::new(),
+            dry: None,
             set_light_color: Function::resolve(light_class, "SetLightColor", &["NewLightColor", "bSRGB"])?,
             begin_draw: Function::resolve(
                 rendering,
@@ -224,8 +316,25 @@ impl MapStyle {
         })
     }
 
-    /// Draws each texture over the whole of `target`, scaled by a brightness, with a blend mode.
-    fn draw(&mut self, rendering: Obj, world: Obj, target: Obj, passes: &[(Obj, f32, u8)]) -> Result<(), String> {
+    fn held(&mut self, which: Held) -> &mut Option<(Weak, Weak)> {
+        match which {
+            Held::Scratch => &mut self.scratch,
+            Held::Dry => &mut self.dry,
+            Held::Squared => &mut self.squared,
+        }
+    }
+
+    fn world_unload(&mut self) {
+        self.scratch = None;
+        self.dry = None;
+        self.squared = None;
+        self.simple_water_tries = 0;
+        self.next_simple_water_try = Instant::now();
+        self.water_report.clear();
+    }
+
+    /// Draws each pass over the whole of `target`.
+    fn draw(&mut self, rendering: Obj, world: Obj, target: Obj, passes: &[Pass]) -> Result<(), String> {
         self.begin_draw.call(rendering, |a| {
             a.set_obj(0, Some(world));
             a.set_obj(1, Some(target));
@@ -234,15 +343,15 @@ impl MapStyle {
         let context = self.begin_draw.param_bytes(4, 16);
         if let Some(canvas) = canvas {
             let size = f64::from(TILE_PIXELS);
-            for &(texture, scale, blend) in passes {
+            for pass in passes {
                 self.draw_texture.call(canvas, |a| {
-                    a.set_obj(0, Some(texture));
+                    a.set_obj(0, Some(pass.texture));
                     a.set(1, Vec2::default());
                     a.set(2, Vec2 { x: size, y: size });
-                    a.set(3, Vec2::default());
+                    a.set(3, Vec2 { x: pass.shift.x / size, y: pass.shift.y / size });
                     a.set(4, Vec2 { x: 1.0, y: 1.0 });
-                    a.set(5, LinearColor { r: scale, g: scale, b: scale, a: 1.0 });
-                    a.set(6, blend);
+                    a.set(5, pass.color);
+                    a.set(6, pass.blend);
                     a.set(7, 0.0f32);
                     a.set(8, Vec2 { x: 0.5, y: 0.5 });
                 });
@@ -261,6 +370,8 @@ struct Tile {
     holder: Weak,
     outside: bool,
     last_seen: Instant,
+    /// Captured while the area was still streaming in, so captured again once it has settled.
+    early: bool,
 }
 
 /// Terrain rendered from above in tiles, where the game's map art cannot show where the player is: dungeons,
@@ -328,6 +439,7 @@ pub struct Terrain {
     next_check: Instant,
     next_capture: Instant,
     settle_until: Instant,
+    warm_until: Instant,
     last_position: Option<Vec3>,
     region_name: &'static str,
 }
@@ -364,7 +476,7 @@ impl Terrain {
             host::warning(&format!("lit terrain cannot leave out the game's sky: {reason}"));
         }
         let post_process = ue::find("/Script/Engine.PostProcessSettings")?;
-        let style = MapStyle::new(rendering, light_class)
+        let style = MapStyle::new(rendering, light_class, capture_base, statics)
             .inspect_err(|reason| host::warning(&format!("terrain tiles keep their natural colors: {reason}")))
             .ok();
         let now = Instant::now();
@@ -448,6 +560,7 @@ impl Terrain {
             next_check: now,
             next_capture: now,
             settle_until: now,
+            warm_until: now,
             last_position: None,
             region_name: "",
         })
@@ -469,7 +582,7 @@ impl Terrain {
         self.scratch = None;
         self.sky = None;
         if let Some(style) = &mut self.style {
-            style.scratch = None;
+            style.world_unload();
         }
         self.failures = 0;
         self.broken = false;
@@ -504,8 +617,13 @@ impl Terrain {
         }
 
         let at = player.location;
-        if self.last_position.is_some_and(|before| (at.x - before.x).hypot(at.y - before.y) > JUMP) {
-            self.settle_until = now + SETTLE;
+        match self.last_position {
+            None => self.warm_until = now + WARMUP,
+            Some(before) if (at.x - before.x).hypot(at.y - before.y) > JUMP => {
+                self.settle_until = now + SETTLE;
+                self.warm_until = now + WARMUP;
+            }
+            Some(_) => {}
         }
         self.last_position = Some(at);
 
@@ -515,6 +633,7 @@ impl Terrain {
             // Another dungeon can be put in the same place, so what was captured there before is stale.
             self.drop_tiles(w, layers, |tile| tile.outside);
             self.settle_until = now + SETTLE;
+            self.warm_until = now + WARMUP;
         }
         self.outside = outside;
 
@@ -552,8 +671,13 @@ impl Terrain {
         self.tiles.retain(|_, tile| tile.texture.get().is_some());
         let mut missing = None;
         if now >= self.next_capture && now >= self.settle_until {
-            let candidates: Vec<TileKey> =
-                wanted.iter().map(|(_, key)| *key).filter(|key| !self.tiles.contains_key(key)).take(LOAD_CHECKS_PER_TICK).collect();
+            let settled = now >= self.warm_until;
+            let candidates: Vec<TileKey> = wanted
+                .iter()
+                .map(|(_, key)| *key)
+                .filter(|key| self.tiles.get(key).is_none_or(|tile| tile.early && settled))
+                .take(LOAD_CHECKS_PER_TICK)
+                .collect();
             missing = candidates
                 .into_iter()
                 .find_map(|key| profile::time("terrain survey", || self.survey(player.world, key)).map(|ground| (key, ground)));
@@ -979,13 +1103,17 @@ impl Terrain {
     }
 
     fn new_target(&mut self, world: Obj, format: u8) -> Result<Obj, String> {
+        self.new_target_sized(world, format, TILE_PIXELS)
+    }
+
+    fn new_target_sized(&mut self, world: Obj, format: u8, size: i32) -> Result<Obj, String> {
         let rendering = self.rendering;
         let raw: *mut c_void = self
             .create_target
             .call(rendering, |a| {
                 a.set_obj(0, Some(world));
-                a.set(1, TILE_PIXELS);
-                a.set(2, TILE_PIXELS);
+                a.set(1, size);
+                a.set(2, size);
                 a.set(3, format);
                 a.set(4, BLACK);
                 a.set(5, false);
@@ -1009,37 +1137,134 @@ impl Terrain {
         Ok(scratch)
     }
 
-    /// The contrast curve over a captured tile, all on the GPU: scratch = a·T² + b·T, then copied back over it.
-    fn grade(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj, tile: Obj) -> Result<(), String> {
-        let Some(style) = self.style.as_ref().filter(|_| self.styled == Some(true)) else { return Ok(()) };
-        let kept = style.scratch.and_then(|(target, holder)| holder.get().and(target.get()));
-        let scratch = match kept {
-            Some(scratch) => scratch,
-            None => {
-                let scratch = self.new_target(world, RGBA16F)?;
-                let holder = layers.hold(w, scratch).ok_or("the minimap has nowhere to keep the grading target")?;
-                if let Some(style) = &mut self.style {
-                    style.scratch = Some((Weak::new(scratch), holder));
-                }
-                scratch
-            }
+    /// One of the map look's targets, made and kept on a widget when missing.
+    fn held_target(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj, which: Held) -> Result<Obj, String> {
+        let Some(style) = &mut self.style else { return Err("the map look is not available".into()) };
+        if let Some(target) = style.held(which).and_then(|(target, holder)| holder.get().and(target.get())) {
+            return Ok(target);
+        }
+        let format = match which {
+            Held::Scratch => RGBA16F,
+            Held::Dry | Held::Squared => RGBA8_SRGB,
         };
+        // Made small, then clamped and resized: the sampler is only built with the resource, and the resize
+        // rebuilds it. Clamped, the blur's shifted reads repeat the edge instead of the tile's other side.
+        let target = self.new_target_sized(world, format, 8)?;
+        let rendering = self.rendering;
+        if let Some(style) = &mut self.style {
+            for offset in style.address_offsets {
+                unsafe { target.write(offset, TEXTURE_CLAMP) };
+            }
+            style.resize_target.call(rendering, |a| {
+                a.set_obj(0, Some(target));
+                a.set(1, TILE_PIXELS);
+                a.set(2, TILE_PIXELS);
+            });
+        }
+        let holder = layers.hold(w, target).ok_or("the minimap has nowhere to keep the map look's targets")?;
+        if let Some(style) = &mut self.style {
+            *style.held(which) = Some((Weak::new(target), holder));
+        }
+        Ok(target)
+    }
+
+    /// Every water actor in the world: the Water plugin's water bodies and zones, and the game's own water.
+    fn water_actors(&mut self, world: Obj) -> Vec<Obj> {
+        let statics = self.statics;
+        let Some(style) = &mut self.style else { return Vec::new() };
+        let now = Instant::now();
+        if style.simple_water.and_then(Weak::get).is_none()
+            && style.simple_water_tries < SIMPLE_WATER_TRIES
+            && now >= style.next_simple_water_try
+        {
+            style.simple_water_tries += 1;
+            style.next_simple_water_try = now + SIMPLE_WATER_RETRY;
+            style.simple_water =
+                profile::time("water class lookup", || ue::find_instance(SIMPLE_WATER_CLASS)).and_then(Obj::class).map(Weak::new);
+        }
+        let classes: Vec<Obj> = style.water_classes.iter().copied().chain(style.simple_water.and_then(Weak::get)).collect();
+        let mut actors = Vec::new();
+        let mut report = Vec::new();
+        for class in classes {
+            style.all_actors.call_reusing(statics, |a| {
+                a.set_obj(0, Some(world));
+                a.set_obj(1, Some(class));
+            });
+            let found = style.all_actors.param_objects(2);
+            report.push(format!("{} {}", found.len(), class.name()));
+            actors.extend(found);
+        }
+        let report = if report.is_empty() { "no water classes loaded".to_string() } else { report.join(", ") };
+        if report != style.water_report {
+            host::info(&format!("water hidden for the terrain water mask: {report}"));
+            style.water_report = report;
+        }
+        actors
+    }
+
+    /// The map look over a captured tile, all on the GPU. With `dry` (the same capture with water hidden): a
+    /// mask m of where the two differ, blurred. Then the contrast curve, a·T² + b·T. Then the water:
+    /// T·(1 − m) + shallow·m + (deep − shallow)·m², deep inside the water and shallow along its soft edge.
+    fn grade(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj, tile: Obj, dry: Option<Obj>) -> Result<(), String> {
+        if self.styled != Some(true) {
+            return Ok(());
+        }
+        let scratch = self.held_target(w, layers, world, Held::Scratch)?;
+        let squared = if dry.is_some() { Some(self.held_target(w, layers, world, Held::Squared)?) } else { None };
         let rendering = self.rendering;
         let Some(style) = &mut self.style else { return Ok(()) };
+        if let Some(dry) = dry {
+            style.draw(
+                rendering,
+                world,
+                scratch,
+                &[pass(tile, gray(WATER_MASK_GAIN), BLEND_OPAQUE), pass(dry, gray(-WATER_MASK_GAIN), BLEND_ADDITIVE)],
+            )?;
+            // The dry target clamps each write to 0..1, so this leaves min(1, gain·|wet − dry|) in it.
+            style.draw(rendering, world, dry, &[pass(scratch, gray(1.0), BLEND_OPAQUE), pass(scratch, gray(-1.0), BLEND_ADDITIVE)])?;
+            style.draw(rendering, world, scratch, &blur_passes(dry, true))?;
+            style.draw(rendering, world, dry, &blur_passes(scratch, false))?;
+        }
         style.draw(
             rendering,
             world,
             scratch,
-            &[(tile, CURVE_SQUARE, BLEND_OPAQUE), (tile, 1.0, BLEND_MODULATE), (tile, CURVE_LINEAR, BLEND_ADDITIVE)],
+            &[
+                pass(tile, gray(CURVE_SQUARE), BLEND_OPAQUE),
+                pass(tile, gray(1.0), BLEND_MODULATE),
+                pass(tile, gray(CURVE_LINEAR), BLEND_ADDITIVE),
+            ],
         )?;
-        style.draw(rendering, world, tile, &[(scratch, 1.0, BLEND_OPAQUE)])
+        style.draw(rendering, world, tile, &[pass(scratch, gray(1.0), BLEND_OPAQUE)])?;
+        if let (Some(mask), Some(squared)) = (dry, squared) {
+            style.draw(rendering, world, squared, &[pass(mask, gray(1.0), BLEND_OPAQUE), pass(mask, gray(1.0), BLEND_MODULATE)])?;
+            style.clear_target.call(rendering, |a| {
+                a.set_obj(0, Some(world));
+                a.set_obj(1, Some(scratch));
+                a.set(2, gray(1.0));
+            });
+            style.draw(
+                rendering,
+                world,
+                scratch,
+                &[
+                    pass(mask, gray(-1.0), BLEND_ADDITIVE),
+                    pass(tile, gray(1.0), BLEND_MODULATE),
+                    pass(mask, SHALLOW_WATER_COLOR, BLEND_ADDITIVE),
+                    pass(squared, add(WATER_COLOR, SHALLOW_WATER_COLOR, -1.0), BLEND_ADDITIVE),
+                ],
+            )?;
+            style.draw(rendering, world, tile, &[pass(scratch, gray(1.0), BLEND_OPAQUE)])?;
+        }
+        Ok(())
     }
 
     /// Renders one tile's square from above into `into`. On the surface the camera goes just over the tile's
     /// highest ground, so nothing is cut off and meshes stay close enough for their detailed versions. Under
-    /// something, it goes just over the player's height band, so the roof is left out. Returns how high the
-    /// camera was over the tile's lowest ground, in metres.
-    fn render(&mut self, player: &Player, key: TileKey, ground: Ground, into: Obj) -> Result<f64, String> {
+    /// something, it goes just over the player's height band, so the roof is left out. With `dry`, it renders
+    /// the tile a second time into it with every water actor hidden. Returns how high the camera was over the
+    /// tile's lowest ground, in metres, and whether the dry capture was made.
+    fn render(&mut self, player: &Player, key: TileKey, ground: Ground, into: Obj, dry: Option<Obj>) -> Result<(f64, bool), String> {
         let component = self.component(player.pawn)?;
         let map_lights = self.map_lights(player.pawn)?;
         let units = key.units();
@@ -1065,10 +1290,30 @@ impl Terrain {
             a.set(2, false);
             a.set(4, true);
         });
+        let water = if dry.is_some() { self.water_actors(player.world) } else { Vec::new() };
         let pause = self.pause_sky(player.world, component, map_lights);
         self.capture.call(component, |_| {});
+        let dry = dry.filter(|_| !water.is_empty());
+        if let Some(dry) = dry {
+            unsafe { component.write(self.target_offset, dry.raw()) };
+            for &actor in &water {
+                self.hide_actor.call(component, |a| {
+                    a.set_obj(0, Some(actor));
+                    a.set(1, true);
+                });
+            }
+            self.capture.call(component, |_| {});
+            // Back to hiding only the pawn. The weather is hidden again by the next capture's sky pause.
+            if let Some(style) = &mut self.style {
+                style.clear_hidden.call(component, |_| {});
+            }
+            self.hide_actor.call(component, |a| {
+                a.set_obj(0, Some(player.pawn));
+                a.set(1, true);
+            });
+        }
         self.resume_sky(pause);
-        Ok((camera_z - deepest) / 100.0)
+        Ok(((camera_z - deepest) / 100.0, dry.is_some()))
     }
 
     /// One step of fitting the map light to the fixed exposure: a few warm-up captures, then the last one is read
@@ -1079,7 +1324,7 @@ impl Terrain {
         let scratch = self.scratch(world)?;
         match self.calibration {
             Calibration::Warming { done, round } => {
-                self.render(player, key, ground, scratch)?;
+                self.render(player, key, ground, scratch, None)?;
                 self.calibration = if done + 1 >= CALIBRATION_WARMUP {
                     Calibration::Measuring { round }
                 } else {
@@ -1117,30 +1362,36 @@ impl Terrain {
         let world = player.world;
         let target = self.new_target(world, RGBA8_SRGB)?;
         let holder = layers.hold(w, target).ok_or("the minimap has nowhere to keep the tile")?;
-        let camera_height = match self.render(player, key, ground, target) {
-            Ok(height) => height,
+        let dry = if self.styled == Some(true) { self.held_target(w, layers, world, Held::Dry).ok() } else { None };
+        let (camera_height, watered) = match self.render(player, key, ground, target, dry) {
+            Ok(rendered) => rendered,
             Err(reason) => {
                 layers.release(w, holder);
                 return Err(reason);
             }
         };
-        if let Err(reason) = profile::time("terrain grade", || self.grade(w, layers, world, target)) {
+        let dry = dry.filter(|_| watered);
+        if let Err(reason) = profile::time("terrain grade", || self.grade(w, layers, world, target, dry)) {
             host::warning(&format!("terrain tiles keep their natural colors from here on: {reason}"));
             if let Some(style) = &mut self.style {
                 style.broken = true;
             }
         }
 
-        self.tiles.insert(key, Tile { texture: Weak::new(target), holder, outside: self.outside, last_seen: Instant::now() });
+        let early = Instant::now() < self.warm_until;
+        let tile = Tile { texture: Weak::new(target), holder, outside: self.outside, last_seen: Instant::now(), early };
+        let again = self.tiles.insert(key, tile).map(|old| layers.release(w, old.holder)).is_some();
         self.evict(w, layers);
         host::info(&format!(
-            "terrain tile {},{} level {} ({:?}) rendered, camera {camera_height:.0} m over the ground's lowest point, {:.2} ms on the game thread, {} tiles kept",
+            "terrain tile {},{} level {} ({:?}) rendered{}, camera {camera_height:.0} m over the ground's lowest point, {:.2} ms on the game thread, {} tiles kept{}",
             key.x,
             key.y,
             key.level,
             key.layer,
+            if again { " again" } else { "" },
             started.elapsed().as_secs_f64() * 1000.0,
-            self.tiles.len()
+            self.tiles.len(),
+            if early { ", early, will be captured again" } else { "" }
         ));
         Ok(())
     }

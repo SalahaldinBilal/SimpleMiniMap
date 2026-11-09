@@ -235,6 +235,12 @@ impl Function {
 
     pub fn call(&mut self, target: Obj, args: impl FnOnce(&mut Args<'_>)) -> &mut Self {
         self.buffer.fill(0);
+        self.call_reusing(target, args)
+    }
+
+    /// Like `call`, but keeps what the last call left in the parameters, so a TArray out parameter keeps the
+    /// engine's allocation and is refilled in it instead of leaking a new one each call.
+    pub fn call_reusing(&mut self, target: Obj, args: impl FnOnce(&mut Args<'_>)) -> &mut Self {
         let mut filled = Args {
             name: self.name,
             bytes: unsafe { std::slice::from_raw_parts_mut(self.buffer.as_mut_ptr().cast::<u8>(), self.size) },
@@ -257,6 +263,17 @@ impl Function {
         let offset = self.params[index];
         assert!(offset + size_of::<T>() <= self.size, "{} parameter {index} read out of bounds", self.name);
         unsafe { self.buffer.as_ptr().cast::<u8>().add(offset).cast::<T>().read_unaligned() }
+    }
+
+    /// The objects in a TArray of object pointers parameter.
+    pub fn param_objects(&self, index: usize) -> Vec<Obj> {
+        let array: ScriptArray = self.param(index);
+        let Ok(len) = usize::try_from(array.num) else { return Vec::new() };
+        if array.data.is_null() {
+            return Vec::new();
+        }
+        let pointers = unsafe { std::slice::from_raw_parts(array.data.cast::<*mut c_void>(), len) };
+        pointers.iter().filter_map(|&pointer| Obj::from_raw(pointer)).collect()
     }
 
     /// A field of a struct parameter, `field` bytes into it.
