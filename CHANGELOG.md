@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-10
+
 - The first terrain tile after loading in no longer shows up as solid water for a few seconds.
 
 ## [0.2.0] - 2026-11-10
