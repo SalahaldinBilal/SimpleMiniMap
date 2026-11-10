@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-10
+
 - Rendered terrain is color matched to the game's own map: cooler colors, pinker sand, deeper greens and darker trees. On by default, "Color terrain like the game's map" in the settings turns it off.
 - Effigies, notes, skill fruit trees, supply drops and treasure maps sit on colored diamonds, keep their size when zoomed out and are drawn above pals and other markers.
 - Death drops are treated like landmarks, with a red ring.
