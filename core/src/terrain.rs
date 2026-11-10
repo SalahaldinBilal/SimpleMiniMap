@@ -646,7 +646,7 @@ impl Terrain {
 
         self.tiles.retain(|_, tile| tile.texture.get().is_some());
         let mut missing = None;
-        if now >= self.next_capture && now >= self.settle_until {
+        if now >= self.next_capture && now >= self.settle_until && self.targets_ready(w, layers, player.world) {
             let settled = now >= self.warm_until;
             let candidates: Vec<TileKey> = wanted
                 .iter()
@@ -1127,6 +1127,26 @@ impl Terrain {
             *style.held(which) = Some((Weak::new(target), holder));
         }
         Ok(target)
+    }
+
+    /// Makes the map look's targets when missing, and says whether they were all there already. A target
+    /// resized this tick still has its old size for canvas draws, so a tile graded with it comes out wrong.
+    fn targets_ready(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj) -> bool {
+        if self.styled != Some(true) {
+            return true;
+        }
+        let mut ready = true;
+        for which in [Held::Dry, Held::Scratch, Held::Squared] {
+            let kept = self
+                .style
+                .as_mut()
+                .and_then(|style| *style.held(which))
+                .is_some_and(|(target, holder)| target.get().is_some() && holder.get().is_some());
+            if !kept && self.held_target(w, layers, world, which).is_ok() {
+                ready = false;
+            }
+        }
+        ready
     }
 
     /// Every water actor in the world: the Water plugin's water bodies and zones, and the game's own water.

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- The first terrain tile after loading in no longer shows up as solid water for a few seconds.
+
 ## [0.2.0] - 2026-11-10
 
 - Rendered terrain is color matched to the game's own map: cooler colors, pinker sand, deeper greens and darker trees. On by default, and the Color terrain like the game's map setting turns it off.
