@@ -134,6 +134,10 @@ impl BossIcon {
     }
 }
 
+// Where a game icon's picture looks centered, as a height fraction of its widget. The teleporter's bird is
+// top heavy, so its widget's middle looks low on a disc (measured from a screenshot).
+const OPTICAL_MIDDLES: [(&str, f64); 1] = [("WBP_Map_IconFTTower_C", 0.46)];
+
 #[derive(Clone, Copy)]
 struct BossSpawner {
     character: Name,
@@ -208,6 +212,7 @@ struct Ui {
     fast_travel_enabled: Function,
     warp_point_class: Obj,
     warp_unlocked: Function,
+    set_pivot: Function,
 }
 
 impl Ui {
@@ -229,6 +234,7 @@ impl Ui {
         let location_point_class = ue::find("/Script/Pal.PalLocationPoint")?;
         let warp_point_class = ue::find("/Script/Pal.PalLocationPointStaticWarpPoint")?;
         Ok(Self {
+            set_pivot: Function::resolve(widget, "SetRenderTransformPivot", &["Pivot"])?,
             fast_travel_enabled: Function::resolve(location_point_class, "IsEnableFastTravel", &[])?,
             warp_unlocked: Function::resolve(warp_point_class, "IsUnlocked", &[])?,
             warp_point_class,
@@ -318,6 +324,15 @@ impl Ui {
 
     fn center(&mut self, slot: Obj) {
         self.slot_alignment.call(slot, |a| a.set(0, Vec2 { x: 0.5, y: 0.5 }));
+    }
+
+    /// Puts a game icon's picture where it looks centered on its anchor, and turns and scales it around there.
+    fn center_game_icon(&mut self, class: Obj, widget: Obj, slot: Obj) {
+        let name = class.name();
+        let y = OPTICAL_MIDDLES.iter().find(|(class, _)| *class == name).map_or(0.5, |&(_, y)| y);
+        let at = Vec2 { x: 0.5, y };
+        self.slot_alignment.call(slot, |a| a.set(0, at));
+        self.set_pivot.call(widget, |a| a.set(0, at));
     }
 
     fn user_widget(&mut self, class: Obj, world: Obj, controller: Obj) -> Result<Obj, String> {
@@ -1230,7 +1245,7 @@ fn create_visual(
             let widget = ui.user_widget(class, context.player.world, context.player.controller)?;
             let slot = ui.attach(layer, widget, z_order)?;
             ui.slot_auto_size.call(slot, |a| a.set(0, true));
-            ui.center(slot);
+            ui.center_game_icon(class, widget, slot);
             let scale = GAME_ICON_SCALE * context.settings.icon_scale;
             ui.set_render_scale.call(widget, |a| a.set(0, Vec2 { x: scale, y: scale }));
             ui.setup_icon(class, widget, location, point, id);
