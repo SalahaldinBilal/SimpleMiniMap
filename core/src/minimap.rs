@@ -171,7 +171,8 @@ struct Ui {
     master_tables: Obj,
     boss_table: Function,
     is_boss_row: Function,
-    boss_flags: HashMap<Name, bool>,
+    is_predator_row: Function,
+    boss_flags: HashMap<Name, (bool, bool)>,
     boss_widget: Option<BossIcon>,
     boss_icon_broken: bool,
     world_map_data_class: Obj,
@@ -241,6 +242,7 @@ impl Ui {
             boss_level_offset: ue::property_offset(boss_data, "Level")?,
             boss_table: Function::resolve(master_tables, "GetBossSpawnerUIDataTable", &["WorldContextObject"])?,
             is_boss_row: Function::resolve(database_class, "GetIsBoss", &["RowName"])?,
+            is_predator_row: Function::resolve(database_class, "GetIsPredatorBoss", &["RowName"])?,
             master_tables,
             boss_flags: HashMap::new(),
             boss_widget: None,
@@ -415,15 +417,16 @@ impl Ui {
         Some(database)
     }
 
-    /// Whether the game's character table marks this character as a boss.
-    fn is_boss(&mut self, world: Obj, character: Name) -> bool {
+    /// Whether the game's character table marks this character as a boss, and as a predator.
+    fn boss_flags(&mut self, world: Obj, character: Name) -> (bool, bool) {
         if let Some(&known) = self.boss_flags.get(&character) {
             return known;
         }
-        let Some(database) = self.database(world) else { return false };
+        let Some(database) = self.database(world) else { return (false, false) };
         let boss = self.is_boss_row.call(database, |a| a.set(0, character)).returned::<u8>() != 0;
-        self.boss_flags.insert(character, boss);
-        boss
+        let predator = self.is_predator_row.call(database, |a| a.set(0, character)).returned::<u8>() != 0;
+        self.boss_flags.insert(character, (boss, predator));
+        (boss, predator)
     }
 
     /// The full map's own boss icon widget, loaded on first use.
@@ -1280,7 +1283,7 @@ fn create_visual(
                 Load::Failed => None,
             };
             let Some(class) = class else {
-                let key = BadgeKey { character: boss.character, boss: true, shiny: false };
+                let key = BadgeKey { character: boss.character, boss: true, predator: false, shiny: false };
                 return badge_visual(ui, tree, layer, z_order, key, sources, context).map(Some);
             };
             let widget = ui.user_widget(class, world, context.player.controller)?;
@@ -1368,7 +1371,7 @@ fn describe_actor(ui: &mut Ui, view: &mut MarkerView, actors: &mut ActorInspecto
     view.look = match described.look {
         ActorLook::Texture(path) => Look::Texture(path),
         ActorLook::Character { id, shiny } => {
-            let boss = ui.is_boss(player.world, id);
+            let (boss, predator) = ui.boss_flags(player.world, id);
             // Captured alphas keep their boss row but belong under OwnPals.
             if described.kind == actors::WILD_PAL {
                 if boss {
@@ -1377,7 +1380,7 @@ fn describe_actor(ui: &mut Ui, view: &mut MarkerView, actors: &mut ActorInspecto
                     view.kind = actors::SHINY_PAL;
                 }
             }
-            Look::Character(BadgeKey { character: id, boss, shiny })
+            Look::Character(BadgeKey { character: id, boss, predator, shiny })
         }
         ActorLook::Hidden => Look::Nothing,
         ActorLook::NotYet => Look::Undecided,

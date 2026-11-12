@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Predator pals get a red ring instead of the gold boss ring.
+
 ## [0.2.1] - 2026-11-10
 
 - The first terrain tile after loading in no longer shows up as solid water for a few seconds.

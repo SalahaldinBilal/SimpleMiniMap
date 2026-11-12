@@ -24,6 +24,7 @@ const BAKE_ATTEMPTS: u32 = 3;
 const RING: [f32; 3] = [255.0, 255.0, 255.0];
 const BOSS_RING: [f32; 3] = [255.0, 190.0, 60.0];
 const SHINY_RING: [f32; 3] = [255.0, 80.0, 220.0];
+const PREDATOR_RING: [f32; 3] = [235.0, 40.0, 40.0];
 
 pub enum BakeStep {
     Done(Obj),
@@ -31,17 +32,20 @@ pub enum BakeStep {
     Failed,
 }
 
-/// Which badge: a species, with the shiny ring, the boss ring or the normal one.
+/// Which badge: a species, with the predator ring, the shiny ring, the boss ring or the normal one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BadgeKey {
     pub character: Name,
     pub boss: bool,
+    pub predator: bool,
     pub shiny: bool,
 }
 
 impl BadgeKey {
     fn ring(self) -> [f32; 3] {
-        if self.shiny {
+        if self.predator {
+            PREDATOR_RING
+        } else if self.shiny {
             SHINY_RING
         } else if self.boss {
             BOSS_RING
@@ -128,7 +132,13 @@ impl Badges {
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
             .collect();
-        let kind = if key.boss { "boss" } else { "badge" };
+        let kind = if key.predator {
+            "predator"
+        } else if key.boss {
+            "boss"
+        } else {
+            "badge"
+        };
         let shiny = if key.shiny { "-shiny" } else { "" };
         self.folder.join(format!("{kind}{shiny}-{STYLE}-{safe}.png"))
     }
@@ -198,7 +208,13 @@ impl Badges {
         host::info(&format!(
             "{}{} for {} made: read back in {read_ms:.1} ms, {:.1} ms total",
             if key.shiny { "shiny " } else { "" },
-            if key.boss { "boss badge" } else { "badge" },
+            if key.predator {
+                "predator badge"
+            } else if key.boss {
+                "boss badge"
+            } else {
+                "badge"
+            },
             key.character.text(),
             started.elapsed().as_secs_f64() * 1000.0
         ));
