@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-12
+
 - Predator pals get a red ring instead of the gold boss ring.
 - The teleporter icon sits centered on its disc.
 
