@@ -54,11 +54,11 @@ const MAP_LIGHT_INTENSITY: f32 = 15.0;
 const NATURAL_LIGHT_INTENSITY: f32 = 7.4;
 
 // Fitted to the game's map art: the map lights' color, then a curve on each captured tile. The curve's powers of
-// x, from x to x⁴: it darkens grass and trees and keeps sand where it is, then levels off so bright sand and snow
-// end near 0.8 instead of clipping to white.
+// x, from x to x⁴. Refitted from raw captures of snow, grass, forest, desert and dark rock against the game's map:
+// at this light the capture is already close, so the curve only takes off a little and slightly more at the top.
 const MAP_LIGHT_COLOR: LinearColor = LinearColor { r: 0.4, g: 0.5, b: 1.0, a: 1.0 };
 const NATURAL_LIGHT_COLOR: LinearColor = LinearColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
-const CURVE: [f32; 4] = [0.0295, 5.2278, -7.6441, 3.1868];
+const CURVE: [f32; 4] = [0.9305, -0.0483, 0.0, 0.0];
 // Water is found by capturing the tile again with it hidden: wherever the two differ by more than 1/50, it is
 // painted the game's map water color, fading out where shallow water barely changes the ground under it.
 const WATER_MASK_GAIN: f32 = 50.0;
