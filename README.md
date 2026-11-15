@@ -55,7 +55,7 @@ Some defaults worth knowing:
 
 ## Notes
 
-- Rendered terrain uses fixed lighting, so tiles match at any time of day. Lakes that get their colour from reflecting the sky can show through to the lake bed, and lamps can brighten tiles captured near them at night.
+- Rendered terrain uses fixed lighting, so tiles match at any time of day. With map colors off, lakes that get their colour from reflecting the sky can show through to the lake bed. Lamps can brighten tiles captured near them at night.
 - Pal portraits are generated once and cached in `Mods\SimpleMiniMap\cache\`. Deleting that folder is safe.
 
 ## Building

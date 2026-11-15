@@ -32,7 +32,7 @@ Settings save as you change them. They are also kept in settings.ini in the mod'
 
 [h2]Notes[/h2]
 [list]
-[*]Rendered terrain uses fixed lighting, so tiles match at any time of day. Lakes that get their colour from reflecting the sky can show through to the lake bed, and lamps can brighten tiles captured near them at night.
+[*]Rendered terrain uses fixed lighting, so tiles match at any time of day. With map colors off, lakes that get their colour from reflecting the sky can show through to the lake bed. Lamps can brighten tiles captured near them at night.
 [*]Built against the UE4SS version the Workshop serves. When UE4SS Experimental updates, update this mod too.
 [/list]
 

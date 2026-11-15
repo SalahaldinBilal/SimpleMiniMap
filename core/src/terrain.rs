@@ -59,16 +59,15 @@ const NATURAL_LIGHT_INTENSITY: f32 = 7.4;
 const MAP_LIGHT_COLOR: LinearColor = LinearColor { r: 0.4, g: 0.5, b: 1.0, a: 1.0 };
 const NATURAL_LIGHT_COLOR: LinearColor = LinearColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 const CURVE: [f32; 4] = [0.9305, -0.0483, 0.0, 0.0];
-// Water is found by capturing the tile again with it hidden: wherever the two differ by more than 1/50, it is
-// painted the game's map water color, fading out where shallow water barely changes the ground under it.
-const WATER_MASK_GAIN: f32 = 50.0;
+// The game's water is flat planes. The map look captures with them hidden and paints water wherever the ground
+// is under a plane's surface, fully at this depth in centimetres and fading in over the shallows.
+const WATER_FULL_DEPTH: f32 = 20.0;
 // The mask is blurred this many pixels each way, so shores fade over a few metres like the game's map, and the
 // fading band gets the lighter shallow color.
 const SHORE_BLUR_PIXELS: i32 = 3;
 const WATER_COLOR: LinearColor = LinearColor { r: 0.0056, g: 0.091, b: 0.122, a: 1.0 };
 const SHALLOW_WATER_COLOR: LinearColor = LinearColor { r: 0.0097, g: 0.156, b: 0.223, a: 1.0 };
 const TEXTURE_CLAMP: u8 = 1;
-const WATER_CLASSES: [&str; 2] = ["/Script/Water.WaterBody", "/Script/Water.WaterZone"];
 const SIMPLE_WATER_CLASS: &str = "BP_SimpleWater_C";
 const SIMPLE_WATER_TRIES: u32 = 3;
 const SIMPLE_WATER_RETRY: Duration = Duration::from_secs(30);
@@ -77,9 +76,11 @@ const SCENE_COLOR_SCENE_DEPTH: u8 = 3;
 const ORTHOGRAPHIC: u8 = 1;
 const RGBA8_SRGB: u8 = 3;
 const RGBA16F: u8 = 6;
+const RGBA32F: u8 = 9;
 const BLEND_OPAQUE: u8 = 0;
 const BLEND_ADDITIVE: u8 = 3;
 const BLEND_MODULATE: u8 = 4;
+const BLEND_ALPHA_COMPOSITE: u8 = 5;
 const AUTO_EXPOSURE_MANUAL: u8 = 2;
 const GLOBAL_ILLUMINATION_NONE: u8 = 0;
 const REFLECTIONS_NONE: u8 = 0;
@@ -181,6 +182,41 @@ struct Ground {
     highest: f64,
 }
 
+/// One tile of the game's water planes: its surface height and the square it covers.
+#[derive(Clone, Copy)]
+struct Water {
+    level: f64,
+    low: Vec2,
+    high: Vec2,
+}
+
+/// A rectangle in a tile's pixels.
+#[derive(Clone, Copy)]
+struct Area {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+const WHOLE: Area = Area { x: 0.0, y: 0.0, width: TILE_PIXELS as f64, height: TILE_PIXELS as f64 };
+
+impl Water {
+    /// The part of the tile the plane covers. The image's top is the tile's north (+X) edge and its left the
+    /// west (-Y) edge.
+    fn area(&self, key: TileKey) -> Option<Area> {
+        let units = key.units();
+        let (low_x, low_y) = (f64::from(key.x) * units, f64::from(key.y) * units);
+        let scale = f64::from(TILE_PIXELS) / units;
+        let clamp = |value: f64| value.clamp(0.0, f64::from(TILE_PIXELS));
+        let left = clamp((self.low.y - low_y) * scale);
+        let right = clamp((self.high.y - low_y) * scale);
+        let top = clamp((low_x + units - self.high.x) * scale);
+        let bottom = clamp((low_x + units - self.low.x) * scale);
+        (right > left && bottom > top).then_some(Area { x: left, y: top, width: right - left, height: bottom - top })
+    }
+}
+
 /// The look fitted to the game's map art: a tinted map light, and a contrast curve drawn over each tile on the GPU.
 struct MapStyle {
     set_light_color: Function,
@@ -193,17 +229,23 @@ struct MapStyle {
     clear_target: Function,
     clear_hidden: Function,
     all_actors: Function,
-    /// The Water plugin's classes, when the game has them loaded.
-    water_classes: Vec<Obj>,
-    /// The game's own water class, a Blueprint, looked up once it is loaded.
-    simple_water: Option<Weak>,
+    instance_count: Function,
+    instance_transform: Function,
+    mesh_box: Function,
+    mesh_offset: usize,
+    /// The game's water class, a Blueprint, looked up once it is loaded, and where its plane mesh sits.
+    simple_water: Option<(Weak, usize)>,
     simple_water_tries: u32,
     next_simple_water_try: Instant,
+    /// The tiles of each water actor seen, worked out once as the planes never move.
+    water_tiles: HashMap<Weak, Vec<Water>>,
     water_report: String,
+    /// The capture with water hidden, its depth below the camera in alpha, and the widget holding it.
+    capture: Option<(Weak, Weak)>,
     /// A float target, so nothing clips between steps, and the widget holding it.
     scratch: Option<(Weak, Weak)>,
-    /// The capture with water hidden, later the water mask, and the widget holding it.
-    dry: Option<(Weak, Weak)>,
+    /// The water mask, and the widget holding it.
+    mask: Option<(Weak, Weak)>,
     /// The water mask squared, and the widget holding it.
     squared: Option<(Weak, Weak)>,
     broken: bool,
@@ -212,9 +254,19 @@ struct MapStyle {
 /// The targets the map look works in.
 #[derive(Clone, Copy)]
 enum Held {
+    Capture,
     Scratch,
-    Dry,
+    Mask,
     Squared,
+}
+
+/// A vector turned by a quaternion (x, y, z, w).
+fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
+    let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let axis = [q[0], q[1], q[2]];
+    let t = cross(axis, v).map(|value| value * 2.0);
+    let u = cross(axis, t);
+    [v[0] + q[3] * t[0] + u[0], v[1] + q[3] * t[1] + u[1], v[2] + q[3] * t[2] + u[2]]
 }
 
 const fn gray(value: f32) -> LinearColor {
@@ -225,18 +277,29 @@ fn add(a: LinearColor, b: LinearColor, scale: f32) -> LinearColor {
     LinearColor { r: a.r + b.r * scale, g: a.g + b.g * scale, b: a.b + b.b * scale, a: 1.0 }
 }
 
-/// One canvas draw: a texture over the whole target, multiplied by a color, with a blend mode, its
-/// texture read shifted by some pixels.
+/// One canvas draw: a texture (white without one) over an area of the target, multiplied by a color, with a
+/// blend mode, its texture read shifted by some pixels.
 #[derive(Clone, Copy)]
 struct Pass {
-    texture: Obj,
+    texture: Option<Obj>,
     color: LinearColor,
     blend: u8,
     shift: Vec2,
+    area: Area,
 }
 
 fn pass(texture: Obj, color: LinearColor, blend: u8) -> Pass {
-    Pass { texture, color, blend, shift: Vec2::default() }
+    Pass { texture: Some(texture), color, blend, shift: Vec2::default(), area: WHOLE }
+}
+
+fn fill(color: LinearColor, area: Area) -> Pass {
+    Pass { texture: None, color, blend: BLEND_OPAQUE, shift: Vec2::default(), area }
+}
+
+impl Pass {
+    fn within(self, area: Area) -> Self {
+        Self { area, ..self }
+    }
 }
 
 /// A box blur along one axis: the first tap replaces what is in the target, the rest add to it.
@@ -247,10 +310,8 @@ fn blur_passes(texture: Obj, horizontal: bool) -> Vec<Pass> {
         .map(|(index, offset)| {
             let step = f64::from(offset);
             Pass {
-                texture,
-                color: weight,
-                blend: if index == 0 { BLEND_OPAQUE } else { BLEND_ADDITIVE },
                 shift: if horizontal { Vec2 { x: step, y: 0.0 } } else { Vec2 { x: 0.0, y: step } },
+                ..pass(texture, weight, if index == 0 { BLEND_OPAQUE } else { BLEND_ADDITIVE })
             }
         })
         .collect()
@@ -259,7 +320,7 @@ fn blur_passes(texture: Obj, horizontal: bool) -> Vec<Pass> {
 impl MapStyle {
     fn new(rendering: Obj, light_class: Obj, capture_base: Obj, statics: Obj) -> Result<Self, String> {
         let canvas = ue::find("/Script/Engine.Canvas")?;
-        let water_classes: Vec<Obj> = WATER_CLASSES.iter().filter_map(|path| ue::find(path).ok()).collect();
+        let instanced = ue::find("/Script/Engine.InstancedStaticMeshComponent")?;
         let target_class = ue::find("/Script/Engine.TextureRenderTarget2D")?;
         Ok(Self {
             address_offsets: [ue::property_offset(target_class, "AddressX")?, ue::property_offset(target_class, "AddressY")?],
@@ -268,12 +329,21 @@ impl MapStyle {
             clear_target: Function::resolve(rendering, "ClearRenderTarget2D", &["WorldContextObject", "TextureRenderTarget", "ClearColor"])?,
             clear_hidden: Function::resolve(capture_base, "ClearHiddenComponents", &[])?,
             all_actors: Function::resolve(statics, "GetAllActorsOfClass", &["WorldContextObject", "actorClass", "OutActors"])?,
-            water_classes,
+            instance_count: Function::resolve(instanced, "GetInstanceCount", &[])?,
+            instance_transform: Function::resolve(
+                instanced,
+                "GetInstanceTransform",
+                &["InstanceIndex", "OutInstanceTransform", "bWorldSpace"],
+            )?,
+            mesh_box: Function::resolve(ue::find("/Script/Engine.StaticMesh")?, "GetBoundingBox", &[])?,
+            mesh_offset: ue::property_offset(ue::find("/Script/Engine.StaticMeshComponent")?, "StaticMesh")?,
             simple_water: None,
             simple_water_tries: 0,
             next_simple_water_try: Instant::now(),
+            water_tiles: HashMap::new(),
             water_report: String::new(),
-            dry: None,
+            capture: None,
+            mask: None,
             set_light_color: Function::resolve(light_class, "SetLightColor", &["NewLightColor", "bSRGB"])?,
             begin_draw: Function::resolve(
                 rendering,
@@ -304,19 +374,58 @@ impl MapStyle {
 
     fn held(&mut self, which: Held) -> &mut Option<(Weak, Weak)> {
         match which {
+            Held::Capture => &mut self.capture,
             Held::Scratch => &mut self.scratch,
-            Held::Dry => &mut self.dry,
+            Held::Mask => &mut self.mask,
             Held::Squared => &mut self.squared,
         }
     }
 
     fn world_unload(&mut self) {
+        self.capture = None;
         self.scratch = None;
-        self.dry = None;
+        self.mask = None;
         self.squared = None;
         self.simple_water_tries = 0;
         self.next_simple_water_try = Instant::now();
+        self.water_tiles.clear();
         self.water_report.clear();
+    }
+
+    /// The tiles of one water actor's plane mesh, each a square at its own height: a water actor can have
+    /// tiles at more than one height, like the pools above and below a waterfall.
+    fn tiles_of(&mut self, mesh: Obj) -> Vec<Water> {
+        let Some(plane) = (unsafe { mesh.read_obj(self.mesh_offset) }) else { return Vec::new() };
+        let [min_x, min_y, _, max_x, max_y, max_z]: [f64; 6] = self.mesh_box.call(plane, |_| {}).returned();
+        let count: i32 = self.instance_count.call(mesh, |_| {}).returned();
+        let mut tiles = Vec::new();
+        for index in 0..count {
+            let found = self
+                .instance_transform
+                .call(mesh, |a| {
+                    a.set(0, index);
+                    a.set(2, true);
+                })
+                .returned::<u8>()
+                != 0;
+            if !found {
+                continue;
+            }
+            let transform: Transform = self.instance_transform.param(1);
+            let corners = [(min_x, min_y), (min_x, max_y), (max_x, min_y), (max_x, max_y)].map(|(x, y)| {
+                let scale = transform.scale;
+                let turned = rotate(transform.rotation, [x * scale[0], y * scale[1], max_z * scale[2]]);
+                let at = transform.translation;
+                [turned[0] + at[0], turned[1] + at[1], turned[2] + at[2]]
+            });
+            let fold = |pick: fn(f64, f64) -> f64, axis: usize| corners.iter().map(|corner| corner[axis]).reduce(pick).unwrap_or_default();
+            tiles.push(Water {
+                level: fold(f64::max, 2),
+                low: Vec2 { x: fold(f64::min, 0), y: fold(f64::min, 1) },
+                high: Vec2 { x: fold(f64::max, 0), y: fold(f64::max, 1) },
+            });
+        }
+        tiles
     }
 
     /// Draws each pass over the whole of `target`.
@@ -330,12 +439,13 @@ impl MapStyle {
         if let Some(canvas) = canvas {
             let size = f64::from(TILE_PIXELS);
             for pass in passes {
+                let area = pass.area;
                 self.draw_texture.call(canvas, |a| {
-                    a.set_obj(0, Some(pass.texture));
-                    a.set(1, Vec2::default());
-                    a.set(2, Vec2 { x: size, y: size });
-                    a.set(3, Vec2 { x: pass.shift.x / size, y: pass.shift.y / size });
-                    a.set(4, Vec2 { x: 1.0, y: 1.0 });
+                    a.set_obj(0, pass.texture);
+                    a.set(1, Vec2 { x: area.x, y: area.y });
+                    a.set(2, Vec2 { x: area.width, y: area.height });
+                    a.set(3, Vec2 { x: (area.x + pass.shift.x) / size, y: (area.y + pass.shift.y) / size });
+                    a.set(4, Vec2 { x: area.width / size, y: area.height / size });
                     a.set(5, pass.color);
                     a.set(6, pass.blend);
                     a.set(7, 0.0f32);
@@ -1105,8 +1215,9 @@ impl Terrain {
             return Ok(target);
         }
         let format = match which {
+            Held::Capture => RGBA32F,
             Held::Scratch => RGBA16F,
-            Held::Dry | Held::Squared => RGBA8_SRGB,
+            Held::Mask | Held::Squared => RGBA8_SRGB,
         };
         // Made small, then clamped and resized: the sampler is only built with the resource, and the resize
         // rebuilds it. Clamped, the blur's shifted reads repeat the edge instead of the tile's other side.
@@ -1136,7 +1247,7 @@ impl Terrain {
             return true;
         }
         let mut ready = true;
-        for which in [Held::Dry, Held::Scratch, Held::Squared] {
+        for which in [Held::Capture, Held::Scratch, Held::Mask, Held::Squared] {
             let kept = self
                 .style
                 .as_mut()
@@ -1149,63 +1260,122 @@ impl Terrain {
         ready
     }
 
-    /// Every water actor in the world: the Water plugin's water bodies and zones, and the game's own water.
-    fn water_actors(&mut self, world: Obj) -> Vec<Obj> {
+    /// The game's water actors, to hide from the capture, and the planes they draw. Looked up for every capture,
+    /// as they stream in and out with the world.
+    fn water(&mut self, world: Obj) -> (Vec<Obj>, Vec<Water>) {
         let statics = self.statics;
-        let Some(style) = &mut self.style else { return Vec::new() };
+        let Some(style) = &mut self.style else { return Default::default() };
         let now = Instant::now();
-        if style.simple_water.and_then(Weak::get).is_none()
+        if style.simple_water.and_then(|(class, _)| class.get()).is_none()
             && style.simple_water_tries < SIMPLE_WATER_TRIES
             && now >= style.next_simple_water_try
         {
             style.simple_water_tries += 1;
             style.next_simple_water_try = now + SIMPLE_WATER_RETRY;
-            style.simple_water =
-                profile::time("water class lookup", || ue::find_instance(SIMPLE_WATER_CLASS)).and_then(Obj::class).map(Weak::new);
-        }
-        let classes: Vec<Obj> = style.water_classes.iter().copied().chain(style.simple_water.and_then(Weak::get)).collect();
-        let mut actors = Vec::new();
-        let mut report = Vec::new();
-        for class in classes {
-            style.all_actors.call_reusing(statics, |a| {
-                a.set_obj(0, Some(world));
-                a.set_obj(1, Some(class));
+            let class = profile::time("water class lookup", || ue::find_instance(SIMPLE_WATER_CLASS)).and_then(Obj::class);
+            style.simple_water = class.and_then(|class| match ue::property_offset(class, "HierarchicalInstancedStaticMesh") {
+                Ok(offset) => Some((Weak::new(class), offset)),
+                Err(reason) => {
+                    host::warning(&format!("rendered terrain has no water: {reason}"));
+                    None
+                }
             });
-            let found = style.all_actors.param_objects(2);
-            report.push(format!("{} {}", found.len(), class.name()));
-            actors.extend(found);
         }
-        let report = if report.is_empty() { "no water classes loaded".to_string() } else { report.join(", ") };
+        let Some((class, mesh_offset)) = style.simple_water.and_then(|(class, offset)| Some((class.get()?, offset))) else {
+            return Default::default();
+        };
+        style.all_actors.call_reusing(statics, |a| {
+            a.set_obj(0, Some(world));
+            a.set_obj(1, Some(class));
+        });
+        let actors = style.all_actors.param_objects(2);
+        let seen: Vec<Weak> = actors.iter().map(|&actor| Weak::new(actor)).collect();
+        style.water_tiles.retain(|actor, _| seen.contains(actor));
+        let mut tiles = Vec::new();
+        for (&actor, known) in actors.iter().zip(&seen) {
+            if !style.water_tiles.contains_key(known) {
+                let found = match unsafe { actor.read_obj(mesh_offset) } {
+                    Some(mesh) => profile::time("water tiles", || style.tiles_of(mesh)),
+                    None => Vec::new(),
+                };
+                style.water_tiles.insert(*known, found);
+            }
+            tiles.extend(style.water_tiles.get(known).into_iter().flatten().copied());
+        }
+        let mut levels: Vec<i64> = tiles.iter().map(|tile| (tile.level / 10.0).round() as i64).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        let levels: Vec<String> = levels.iter().map(|level| format!("{:.1} m", *level as f64 / 10.0)).collect();
+        let report = format!("{} water actors, {} tiles, surfaces at {}", actors.len(), tiles.len(), levels.join(", "));
         if report != style.water_report {
-            host::info(&format!("water hidden for the terrain water mask: {report}"));
+            host::info(&format!("water for rendered terrain: {report}"));
             style.water_report = report;
         }
-        actors
+        (actors, tiles)
     }
 
-    /// The map look over a captured tile, all on the GPU. With `dry` (the same capture with water hidden): a
-    /// mask m of where the two differ, blurred. Then the curve, worked out from the highest power down with a
-    /// white target as the constant. Then the water: T·(1 − m) + shallow·m + (deep − shallow)·m², deep inside the
-    /// water and shallow along its soft edge.
-    fn grade(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj, tile: Obj, dry: Option<Obj>) -> Result<(), String> {
-        if self.styled != Some(true) {
-            return Ok(());
-        }
+    /// The map look, all on the GPU, from `capture` (the tile with water hidden, its depth under the camera in
+    /// alpha) into `tile`. First a water mask m: within each water plane, how far the ground is under its
+    /// surface as a share of the full depth, blurred. Then the curve, worked out from the highest power down with
+    /// a white target as the constant. Then the water: T·(1 − m) + shallow·m + (deep − shallow)·m², deep inside
+    /// the water and shallow along its soft edge.
+    #[allow(clippy::too_many_arguments)]
+    fn grade(
+        &mut self,
+        w: &mut Widgets,
+        layers: &mut Layers,
+        world: Obj,
+        key: TileKey,
+        camera_z: f64,
+        capture: Obj,
+        tile: Obj,
+        water: &[Water],
+    ) -> Result<(), String> {
         let scratch = self.held_target(w, layers, world, Held::Scratch)?;
+        let mask = self.held_target(w, layers, world, Held::Mask)?;
         let squared = self.held_target(w, layers, world, Held::Squared)?;
         let rendering = self.rendering;
-        let Some(style) = &mut self.style else { return Ok(()) };
-        if let Some(dry) = dry {
-            style.draw(
-                rendering,
-                world,
-                scratch,
-                &[pass(tile, gray(WATER_MASK_GAIN), BLEND_OPAQUE), pass(dry, gray(-WATER_MASK_GAIN), BLEND_ADDITIVE)],
-            )?;
-            // The dry target clamps each write to 0..1, so this leaves min(1, gain·|wet − dry|) in it.
-            style.draw(rendering, world, dry, &[pass(scratch, gray(1.0), BLEND_OPAQUE), pass(scratch, gray(-1.0), BLEND_ADDITIVE)])?;
-            style.draw(rendering, world, scratch, &blur_passes(dry, true))?;
-            style.draw(rendering, world, dry, &blur_passes(scratch, false))?;
+        let Some(style) = &mut self.style else { return Err("the map look is not available".into()) };
+        style.draw(rendering, world, tile, &[pass(capture, gray(1.0), BLEND_OPAQUE)])?;
+        // Water tiles grouped by surface height to the centimetre, so each height takes a few draws however many
+        // tiles it has.
+        let mut planes: Vec<(i64, Vec<Area>)> = Vec::new();
+        for plane in water.iter().filter(|plane| plane.level < camera_z) {
+            let Some(area) = plane.area(key) else { continue };
+            let level = plane.level.round() as i64;
+            match planes.iter_mut().find(|(known, _)| *known == level) {
+                Some((_, areas)) => areas.push(area),
+                None => planes.push((level, vec![area])),
+            }
+        }
+        if !planes.is_empty() {
+            style.clear_target.call(rendering, |a| {
+                a.set_obj(0, Some(world));
+                a.set_obj(1, Some(mask));
+                a.set(2, BLACK);
+            });
+            let gain = 1.0 / WATER_FULL_DEPTH;
+            for (level, areas) in &planes {
+                let surface = (camera_z - *level as f64) as f32;
+                // From −gain·surface, scaling by 1 − depth/surface leaves gain·(depth − surface).
+                let under = LinearColor { r: 0.0, g: 0.0, b: 0.0, a: 1.0 / surface };
+                let passes: Vec<Pass> = areas
+                    .iter()
+                    .flat_map(|&area| [fill(gray(-gain * surface), area), pass(capture, under, BLEND_ALPHA_COMPOSITE).within(area)])
+                    .collect();
+                style.draw(rendering, world, scratch, &passes)?;
+                // Clamped to 0..1 by the 8 bit target, then added, so heights only add to each other.
+                style.clear_target.call(rendering, |a| {
+                    a.set_obj(0, Some(world));
+                    a.set_obj(1, Some(squared));
+                    a.set(2, BLACK);
+                });
+                let copies: Vec<Pass> = areas.iter().map(|&area| pass(scratch, gray(1.0), BLEND_OPAQUE).within(area)).collect();
+                style.draw(rendering, world, squared, &copies)?;
+                style.draw(rendering, world, mask, &[pass(squared, gray(1.0), BLEND_ADDITIVE)])?;
+            }
+            style.draw(rendering, world, scratch, &blur_passes(mask, true))?;
+            style.draw(rendering, world, mask, &blur_passes(scratch, false))?;
         }
         // The squared target is free until the water step, so it stands in as white here.
         let white = squared;
@@ -1231,7 +1401,7 @@ impl Terrain {
             ],
         )?;
         style.draw(rendering, world, tile, &[pass(scratch, gray(1.0), BLEND_OPAQUE)])?;
-        if let Some(mask) = dry {
+        if !planes.is_empty() {
             style.draw(rendering, world, squared, &[pass(mask, gray(1.0), BLEND_OPAQUE), pass(mask, gray(1.0), BLEND_MODULATE)])?;
             style.clear_target.call(rendering, |a| {
                 a.set_obj(0, Some(world));
@@ -1256,10 +1426,9 @@ impl Terrain {
 
     /// Renders one tile's square from above into `into`. On the surface the camera goes just over the tile's
     /// highest ground, so nothing is cut off and meshes stay close enough for their detailed versions. Under
-    /// something, it goes just over the player's height band, so the roof is left out. With `dry`, it renders
-    /// the tile a second time into it with every water actor hidden. Returns how high the camera was over the
-    /// tile's lowest ground, in metres, and whether the dry capture was made.
-    fn render(&mut self, player: &Player, key: TileKey, ground: Ground, into: Obj, dry: Option<Obj>) -> Result<(f64, bool), String> {
+    /// something, it goes just over the player's height band, so the roof is left out. `hidden` actors are left
+    /// out of it. Returns the camera's height, and how high it was over the tile's lowest ground in metres.
+    fn render(&mut self, player: &Player, key: TileKey, ground: Ground, into: Obj, hidden: &[Obj]) -> Result<(f64, f64), String> {
         let component = self.component(player.pawn)?;
         let map_lights = self.map_lights(player.pawn)?;
         let units = key.units();
@@ -1285,19 +1454,15 @@ impl Terrain {
             a.set(2, false);
             a.set(4, true);
         });
-        let water = if dry.is_some() { self.water_actors(player.world) } else { Vec::new() };
         let pause = self.pause_sky(player.world, component, map_lights);
+        for &actor in hidden {
+            self.hide_actor.call(component, |a| {
+                a.set_obj(0, Some(actor));
+                a.set(1, true);
+            });
+        }
         self.capture.call(component, |_| {});
-        let dry = dry.filter(|_| !water.is_empty());
-        if let Some(dry) = dry {
-            unsafe { component.write(self.target_offset, dry.raw()) };
-            for &actor in &water {
-                self.hide_actor.call(component, |a| {
-                    a.set_obj(0, Some(actor));
-                    a.set(1, true);
-                });
-            }
-            self.capture.call(component, |_| {});
+        if !hidden.is_empty() {
             // Back to hiding only the pawn. The weather is hidden again by the next capture's sky pause.
             if let Some(style) = &mut self.style {
                 style.clear_hidden.call(component, |_| {});
@@ -1308,28 +1473,43 @@ impl Terrain {
             });
         }
         self.resume_sky(pause);
-        Ok(((camera_z - deepest) / 100.0, dry.is_some()))
+        Ok((camera_z, (camera_z - deepest) / 100.0))
     }
 
+    /// In natural colors the tile is captured as the game draws it. With the map look it is captured with the
+    /// water hidden, and the look paints the water from the game's water planes.
     fn capture_tile(&mut self, w: &mut Widgets, layers: &mut Layers, player: &Player, key: TileKey, ground: Ground) -> Result<(), String> {
         let started = Instant::now();
         let world = player.world;
         let target = self.new_target(world, RGBA8_SRGB)?;
         let holder = layers.hold(w, target).ok_or("the minimap has nowhere to keep the tile")?;
-        let dry = if self.styled == Some(true) { self.held_target(w, layers, world, Held::Dry).ok() } else { None };
-        let (camera_height, watered) = match self.render(player, key, ground, target, dry) {
+        let capture = match self.styled {
+            Some(true) => match self.held_target(w, layers, world, Held::Capture) {
+                Ok(capture) => Some(capture),
+                Err(reason) => {
+                    layers.release(w, holder);
+                    return Err(reason);
+                }
+            },
+            _ => None,
+        };
+        let (hidden, water) = if capture.is_some() { self.water(world) } else { Default::default() };
+        let (camera_z, camera_height) = match self.render(player, key, ground, capture.unwrap_or(target), &hidden) {
             Ok(rendered) => rendered,
             Err(reason) => {
                 layers.release(w, holder);
                 return Err(reason);
             }
         };
-        let dry = dry.filter(|_| watered);
-        if let Err(reason) = profile::time("terrain grade", || self.grade(w, layers, world, target, dry)) {
+        if let Some(capture) = capture
+            && let Err(reason) = profile::time("terrain grade", || self.grade(w, layers, world, key, camera_z, capture, target, &water))
+        {
             host::warning(&format!("terrain tiles keep their natural colors from here on: {reason}"));
             if let Some(style) = &mut self.style {
                 style.broken = true;
             }
+            layers.release(w, holder);
+            return Err(reason);
         }
 
         let early = Instant::now() < self.warm_until;

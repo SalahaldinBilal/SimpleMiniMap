@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- With map colors on, rendered terrain draws water from the game's own water surfaces, so lakes and ponds show up instead of showing through to the lake bed. Each tile now takes one capture instead of two.
+
 ## [0.2.2] - 2026-11-12
 
 - Predator pals get a red ring instead of the gold boss ring.
