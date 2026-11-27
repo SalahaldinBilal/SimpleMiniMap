@@ -96,6 +96,10 @@ Changing the host interface: `SMM_HOST_API_VERSION` in `smm_host.h` and `API_VER
 
 ## Open work
 
-- Performance pass from the timing tree. Known spikes: badge bakes (readbacks), the map icon class poll (about 30 ms once a second).
+- Performance pass from the timing tree. Known spikes:
+  - badge bakes (readbacks)
+  - the map icon class poll: `find_instance("WBP_Map_Base_C")` walks every object, 30 to 45 ms, every 10 s until the game's own map has been opened in the session
+  - terrain tile saves: the frame a media capture starts is 4 to 20 ms longer, with a new or a reused capture alike. Untried fixes: `ImageWriteBlueprintLibrary.ExportToDisk` with `bAsync`, then our own non-blocking D3D12 copy in the shim. Saving only behind menus was rejected (it moves the hitch into menus).
+- Hitches and other known issues are only recorded here, never in `README.md` or the Workshop description.
 - Releases: `.github/workflows/release.yml` runs on a `v*.*.*` tag that must match the version in `core/Cargo.toml`, `ModVersion` in `shim/src/dllmain.cpp` and `workshop/Info.json`. It builds with Ninja and `SMM_DEPLOY=OFF`, publishes `SimpleMiniMap-<version>.zip` (a `SimpleMiniMap` folder with `dlls\main.dll` and `enabled.txt`) as a GitHub release, and uploads to the Steam Workshop (Palworld app 1623730) with steamcmd. Release notes come from the version's section in `CHANGELOG.md`, which must not contain double quotes or backslashes either (the Workshop upload rejects them). Changes go under `## [Unreleased]`, and `./scripts/bump-version.ps1 <version>` sets the version in all of them and turns that section into the release's. The Workshop item is built from `workshop/` (`Info.json`, `thumbnail.png`, and `description.txt` in Steam BBCode, with no double quotes or backslashes). Keep `README.md` and `workshop/description.txt` in step with features, keys and defaults. The user runs git.
 

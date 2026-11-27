@@ -33,7 +33,9 @@ Settings save as you change them. They are also kept in settings.ini in the mod'
 [h2]Notes[/h2]
 [list]
 [*]Rendered terrain uses fixed lighting, so tiles match at any time of day. With map colors off, lakes that get their colour from reflecting the sky can show through to the lake bed. Lamps, torches and glowing pals are switched off for the moment of each capture, though their glowing surfaces can still show as small bright spots.
-[*]Saved terrain is captured again when the game updates or when structures in that area change. The settings window can turn saving off or clear what was saved.
+[*]Pals, people and other players are left out of rendered terrain.
+[*]Only overworld terrain is saved. Dungeon terrain is captured fresh on each visit.
+[*]Saved terrain is captured again when the game updates or when player structures in that area change. The settings window can turn saving off or clear what was saved.
 [*]Built against the UE4SS version the Workshop serves. When UE4SS Experimental updates, update this mod too.
 [/list]
 
