@@ -32,6 +32,7 @@ const WINDOW_SIZE: Vec2 = Vec2 { x: 920.0, y: 660.0 };
 const CONTROL_WIDTH: f32 = 380.0;
 const MUTED_ROW: f32 = 0.35;
 const INPUT_EVERY: Duration = Duration::from_millis(250);
+const CONFIRM_FOR: Duration = Duration::from_secs(3);
 const HANDLE: f64 = 18.0;
 const EDGE: f64 = 2.0;
 const Z_MENU: i32 = 50;
@@ -53,6 +54,7 @@ enum Toggle {
     EdgePins,
     FogOfWar,
     MapColors,
+    TerrainCache,
     Category(usize),
     Pickup(usize),
 }
@@ -136,6 +138,7 @@ impl Toggle {
             Toggle::EdgePins => settings.edge_pins,
             Toggle::FogOfWar => settings.fog_of_war,
             Toggle::MapColors => settings.map_colors,
+            Toggle::TerrainCache => settings.terrain_cache,
             Toggle::Category(index) => settings.categories[index],
             Toggle::Pickup(index) => settings.pickups.get(index).is_some_and(|(_, shown)| *shown),
         }
@@ -155,6 +158,7 @@ impl Toggle {
             Toggle::EdgePins => settings.edge_pins = on,
             Toggle::FogOfWar => settings.fog_of_war = on,
             Toggle::MapColors => settings.map_colors = on,
+            Toggle::TerrainCache => settings.terrain_cache = on,
             Toggle::Category(index) => settings.categories[index] = on,
             Toggle::Pickup(index) => {
                 if let Some(entry) = settings.pickups.get_mut(index) {
@@ -279,6 +283,21 @@ enum Kind {
     Slider { number: Number, slider: Weak, text: Weak, last: f32 },
     Group { group: usize, pill: Labeled, banner: Weak, edge: Weak, count: Weak, rows: Vec<Weak>, members: Vec<Toggle> },
     Key { action: KeyAction, button: Labeled },
+    /// A one-off action, asked to be clicked twice so it is not done by accident.
+    Command { command: Command, button: Labeled, armed_until: Option<Instant> },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Command {
+    ClearTerrainCache,
+}
+
+impl Command {
+    fn label(self) -> &'static str {
+        match self {
+            Command::ClearTerrainCache => "Clear",
+        }
+    }
 }
 
 struct Control {
@@ -344,11 +363,17 @@ pub struct Menu {
     w: Widgets,
     window: Option<Window>,
     toggle_requested: bool,
+    command: Option<Command>,
 }
 
 impl Menu {
     pub fn new() -> Result<Self, String> {
-        Ok(Self { w: Widgets::resolve()?, window: None, toggle_requested: false })
+        Ok(Self { w: Widgets::resolve()?, window: None, toggle_requested: false, command: None })
+    }
+
+    /// A command clicked in the menu, once.
+    pub fn take_command(&mut self) -> Option<Command> {
+        self.command.take()
     }
 
     pub fn widgets(&mut self) -> &mut Widgets {
@@ -477,6 +502,7 @@ impl Menu {
         let mut changed = false;
         let current = window.current;
         let mut listen = None;
+        let mut ran = None;
         for (index, control) in window.controls.iter_mut().enumerate() {
             if control.tab != current {
                 continue;
@@ -520,7 +546,25 @@ impl Menu {
                         listen = Some(index);
                     }
                 }
+                Kind::Command { command, button, armed_until } => {
+                    let now = Instant::now();
+                    if armed_until.is_some_and(|until| now >= until) {
+                        *armed_until = None;
+                        changed = true;
+                    }
+                    if button.clickable.clicked(w) {
+                        if armed_until.take().is_some() {
+                            ran = Some(*command);
+                        } else {
+                            *armed_until = Some(now + CONFIRM_FOR);
+                        }
+                        changed = true;
+                    }
+                }
             }
+        }
+        if ran.is_some() {
+            self.command = ran;
         }
         if let Some(index) = listen {
             window.listening = Some(index);
@@ -663,6 +707,16 @@ impl Menu {
                         w.button_color(button, if listening { ACCENT } else { OFF });
                     }
                 }
+                Kind::Command { command, button, armed_until } => {
+                    let armed = armed_until.is_some();
+                    if let Some(text) = button.text.get() {
+                        w.set_text(text, if armed { "Click again to clear" } else { command.label() });
+                        w.text_color(text, if armed { ON_ACCENT } else { TEXT });
+                    }
+                    if let Some(button) = button.clickable.button.get() {
+                        w.button_color(button, if armed { ACCENT } else { OFF });
+                    }
+                }
             }
         }
     }
@@ -754,6 +808,8 @@ impl Menu {
         add_cycle(w, &mut window, tree, page, 0, "Rendered terrain in the overworld", Cycle::OverworldTerrain)?;
         add_cycle(w, &mut window, tree, page, 0, "Rendered terrain in dungeons", Cycle::DungeonTerrain)?;
         add_switch(w, &mut window, tree, page, 0, "Color terrain like the game's map", Toggle::MapColors, None)?;
+        add_switch(w, &mut window, tree, page, 0, "Save rendered terrain between sessions", Toggle::TerrainCache, None)?;
+        add_command(w, &mut window, tree, page, 0, "Saved terrain", Command::ClearTerrainCache)?;
         add_switch(w, &mut window, tree, page, 0, "Clouds over unexplored areas", Toggle::FogOfWar, None)?;
         add_switch(w, &mut window, tree, page, 0, "Show markers in unexplored areas", Toggle::MarkersInFog, None)?;
 
@@ -1131,6 +1187,14 @@ fn add_key(w: &mut Widgets, window: &mut Window, tree: Obj, page: Obj, label: &s
     let button = labeled_button(w, tree, "", 14, OFF, None, Some(30.0))?;
     w.hbox_add(control, button.outer, Place::fill().align(FILL, CENTER))?;
     window.controls.push(Control { tab: 2, kind: Kind::Key { action, button: button.labeled() } });
+    Ok(())
+}
+
+fn add_command(w: &mut Widgets, window: &mut Window, tree: Obj, page: Obj, tab: usize, label: &str, command: Command) -> Result<(), String> {
+    let (_, control) = row(w, tree, page, label, None, 0.0)?;
+    let button = labeled_button(w, tree, command.label(), 14, OFF, None, Some(30.0))?;
+    w.hbox_add(control, button.outer, Place::fill().align(FILL, CENTER))?;
+    window.controls.push(Control { tab, kind: Kind::Command { command, button: button.labeled(), armed_until: None } });
     Ok(())
 }
 

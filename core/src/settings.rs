@@ -200,6 +200,8 @@ pub struct Settings {
     pub dungeon_terrain: TerrainUse,
     /// Rendered terrain colored to look like the game's map art.
     pub map_colors: bool,
+    /// Rendered terrain tiles saved to disk and loaded back in later sessions.
+    pub terrain_cache: bool,
     pub toggle_keys: Vec<KeyBind>,
     pub zoom_in_keys: Vec<KeyBind>,
     pub zoom_out_keys: Vec<KeyBind>,
@@ -240,6 +242,7 @@ impl Default for Settings {
             overworld_terrain: TerrainUse::On,
             dungeon_terrain: TerrainUse::On,
             map_colors: true,
+            terrain_cache: true,
             toggle_keys: parse_keys("Alt+N"),
             zoom_in_keys: parse_keys("Alt+Equals, Alt+NumpadPlus"),
             zoom_out_keys: parse_keys("Alt+Minus, Alt+NumpadMinus"),
@@ -387,6 +390,7 @@ impl Settings {
             ("minimap", "overworldterrain") => TerrainUse::parse(value).map(|v| self.overworld_terrain = v).is_some(),
             ("minimap", "dungeonterrain") => TerrainUse::parse(value).map(|v| self.dungeon_terrain = v).is_some(),
             ("minimap", "terrainmapcolors") => parse_bool(value).map(|v| self.map_colors = v).is_some(),
+            ("minimap", "terraincache") => parse_bool(value).map(|v| self.terrain_cache = v).is_some(),
             ("keys", "megazoom") => set_keys(&mut self.megazoom_keys, value),
             ("keys", "toggle") => set_keys(&mut self.toggle_keys, value),
             ("keys", "zoomin") => set_keys(&mut self.zoom_in_keys, value),
@@ -463,6 +467,8 @@ impl Settings {
         let _ = writeln!(text, "DungeonTerrain = {}", self.dungeon_terrain.name());
         let _ = writeln!(text, "; colors rendered terrain to look like the game's own map, false keeps its natural colors");
         let _ = writeln!(text, "TerrainMapColors = {}", self.map_colors);
+        let _ = writeln!(text, "; saves rendered overworld terrain to disk, so it shows right away in later sessions");
+        let _ = writeln!(text, "TerrainCache = {}", self.terrain_cache);
         let _ = writeln!(text);
         let _ = writeln!(text, "[Keys]");
         let _ = writeln!(text, "; Combine Alt, Ctrl and Shift with a key, separate alternatives with commas.");

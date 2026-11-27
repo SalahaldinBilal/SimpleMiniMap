@@ -49,14 +49,16 @@ Some defaults worth knowing:
 
 - Rendered terrain is on in the overworld and in dungeons. Each one can be set to Off, On, or "When zoomed in close" (400 m or less across).
 - Rendered terrain is colored to look like the game's own map. Turn off "Color terrain like the game's map" for its natural colors.
+- Rendered overworld terrain is saved to disk and loaded back next time, so areas you have been to show right away. Turn off "Save rendered terrain between sessions" to stop that, and use the Clear button next to it to delete what was saved.
 - The view is 220 m across, and 120 m in dungeons.
 - Respawn points and your own pals are hidden. So are very common pickups (wood, stone, small pal crystals, berries, eggs, arrows, leather and wool).
 - The minimap hides inside your bases.
 
 ## Notes
 
-- Rendered terrain uses fixed lighting, so tiles match at any time of day. With map colors off, lakes that get their colour from reflecting the sky can show through to the lake bed. Lamps can brighten tiles captured near them at night.
-- Pal portraits are generated once and cached in `Mods\SimpleMiniMap\cache\`. Deleting that folder is safe.
+- Rendered terrain uses fixed lighting, so tiles match at any time of day. With map colors off, lakes that get their colour from reflecting the sky can show through to the lake bed. Lamps, torches and glowing pals are switched off for the moment of each capture, though their glowing surfaces can still show as small bright spots.
+- Saved terrain is captured again when the game updates or when structures in that area change. Each saved tile takes about half a megabyte.
+- Pal portraits and saved terrain are kept in `Mods\SimpleMiniMap\cache\`. Deleting that folder is safe.
 
 ## Building
 

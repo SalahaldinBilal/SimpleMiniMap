@@ -4,9 +4,20 @@ use std::ffi::c_void;
 use crate::actors::{self, CHEST, ITEM_PICKUP, JUNK, ORE, SKILL_FRUIT};
 use crate::host;
 use crate::icons::IconTable;
-use crate::ue::{self, Function, Name, Obj, SoftObjectPtr, Vec3};
+use crate::ue::{self, Function, Guid, Name, Obj, SoftObjectPtr, Vec3};
 
 const ORES_WITHOUT_MAP_ICON: [&str; 2] = ["DamagableRock0019", "DamagableRock0020"];
+const BUILD_COMPLETED: u8 = 1;
+
+/// A structure a player built, finished or still a blueprint.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Build {
+    pub id: Guid,
+    pub kind: Name,
+    pub x: f64,
+    pub y: f64,
+    pub completed: bool,
+}
 
 /// One map object worth a marker.
 pub struct MapObject {
@@ -57,6 +68,13 @@ pub struct MapObjects {
     ui_utility: Obj,
     text_library: Obj,
     reported: bool,
+    instance_id_offset: usize,
+    build_player_offset: usize,
+    build_object_offset: usize,
+    build_process_offset: usize,
+    build_state_offset: usize,
+    builds: Vec<Build>,
+    models: usize,
 }
 
 impl MapObjects {
@@ -92,6 +110,13 @@ impl MapObjects {
             looks: HashMap::new(),
             items: HashMap::new(),
             reported: false,
+            instance_id_offset: ue::property_offset(model_class, "InstanceId")?,
+            build_player_offset: ue::property_offset(model_class, "BuildPlayerUId")?,
+            build_object_offset: ue::property_offset(model_class, "BuildObjectId")?,
+            build_process_offset: ue::property_offset(model_class, "BuildProcess")?,
+            build_state_offset: ue::property_offset(ue::find("/Script/Pal.PalBuildProcess")?, "State")?,
+            builds: Vec::new(),
+            models: 0,
         })
     }
 
@@ -173,6 +198,8 @@ impl MapObjects {
     /// Fills `out` with the map objects that get markers. Returns how many models the host has in all.
     pub fn scan(&mut self, world: Obj, icons: &IconTable, out: &mut Vec<MapObject>) -> Result<usize, String> {
         out.clear();
+        self.builds.clear();
+        self.models = 0;
         let manager: *mut c_void = self
             .get_manager
             .call(self.utility, |a| a.set_obj(0, Some(world)))
@@ -186,6 +213,15 @@ impl MapObjects {
             let id: Name = unsafe { model.read(self.master_id_offset) };
             if !self.reported {
                 *counts.entry(id).or_default() += 1;
+            }
+            // Chests, rocks and dropped items carry a player id too. Only built structures have a build object id.
+            let builder: Guid = unsafe { model.read(self.build_player_offset) };
+            let built: Name = unsafe { model.read(self.build_object_offset) };
+            if builder != Guid::default() && built != Name::NONE {
+                let process = unsafe { model.read_obj(self.build_process_offset) };
+                let completed = process.is_none_or(|process| unsafe { process.read::<u8>(self.build_state_offset) } == BUILD_COMPLETED);
+                let at: Vec3 = unsafe { model.read(self.translation_offset) };
+                self.builds.push(Build { id: unsafe { model.read(self.instance_id_offset) }, kind: id, x: at.x, y: at.y, completed });
             }
             let look = match self.looks.get(&id) {
                 Some(look) => look.clone(),
@@ -213,7 +249,13 @@ impl MapObjects {
             self.reported = true;
             self.report(&counts);
         }
+        self.models = pairs.len();
         Ok(pairs.len())
+    }
+
+    /// The structures players built, from the last scan, and how many map objects that scan saw in all.
+    pub fn builds(&self) -> (&[Build], usize) {
+        (&self.builds, self.models)
     }
 
     /// Opened chests and searched junk piles stay in the world; their model says so.

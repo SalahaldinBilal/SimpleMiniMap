@@ -70,6 +70,8 @@ pub type SoftObjectPtr = [u8; 0x30];
 pub struct Name(u64);
 
 impl Name {
+    pub const NONE: Self = Self(0);
+
     pub fn new(text: &str) -> Self {
         Self(unsafe { (host::api().make_name)(text.as_ptr(), text.len()) })
     }
@@ -128,6 +130,32 @@ pub fn set_bool_property(object: Obj, name: &str, value: bool) -> bool {
 /// `container` must point at a live value of that struct.
 pub unsafe fn set_struct_bool(ustruct: Obj, container: *mut c_void, name: &str, value: bool) -> bool {
     unsafe { (host::api().set_struct_bool)(ustruct.raw(), container, name.as_ptr(), name.len(), value) }
+}
+
+/// Sets an FString field of a value of type `ustruct` (a class or a struct) at `container`, in engine memory.
+///
+/// # Safety
+/// `container` must point at a live value of that type.
+pub unsafe fn set_string(ustruct: Obj, container: *mut c_void, name: &str, text: &str) -> bool {
+    unsafe { (host::api().set_string)(ustruct.raw(), container, name.as_ptr(), name.len(), text.as_ptr(), text.len()) }
+}
+
+/// Keeps an object from being garbage collected while nothing in the engine references it, or lets it go again.
+pub fn set_rooted(object: Obj, rooted: bool) {
+    unsafe { (host::api().set_rooted)(object.raw(), rooted) }
+}
+
+/// Walks the engine's object list from `start` for up to `budget_ms`, adding live objects of `class` (and its
+/// subclasses, no defaults or templates) to `out`. Returns where to go on from, 0 once the walk reached the end.
+pub fn scan_objects(class: Obj, start: i32, budget_ms: f64, out: &mut Vec<Obj>) -> i32 {
+    let mut found = [std::ptr::null_mut::<c_void>(); 256];
+    let mut count = 0i32;
+    let next = unsafe {
+        (host::api().scan_objects)(class.raw(), start, budget_ms, found.as_mut_ptr(), found.len() as i32, &mut count)
+    };
+    let count = usize::try_from(count).unwrap_or(0).min(found.len());
+    out.extend(found[..count].iter().filter_map(|&raw| Obj::from_raw(raw)));
+    next
 }
 
 fn fill_pointers(
@@ -403,7 +431,7 @@ pub struct SlateColor {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
 pub struct Guid {
     pub parts: [u32; 4],
 }

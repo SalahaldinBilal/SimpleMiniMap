@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 use crate::game::Player;
 use crate::host;
 use crate::layers::{Layers, TileView};
+use crate::objects::Build;
 use crate::profile;
-use crate::settings::{Settings, TerrainUse};
-use crate::ue::{self, Anchors, Function, LinearColor, Obj, Rotator, Vec2, Vec3, Weak};
+use crate::settings::{self, Settings, TerrainUse};
+use crate::tilecache::{CacheKey, Fnv, TileCache};
+use crate::ue::{self, Anchors, Function, Guid, LinearColor, Obj, Rotator, Vec2, Vec3, Weak};
 use crate::widgets::Widgets;
 use crate::worldmap::{self, Region};
 
@@ -17,6 +19,16 @@ const TILE_PIXELS: i32 = 512;
 const MAX_LEVEL: u8 = 4;
 // Each tile is one 1 MB render target, kept for the session.
 const MAX_TILES: usize = 64;
+// Tiles still being written to disk are kept past the limit, up to this many more.
+const SAVING_SLACK: usize = 32;
+// Bump whenever anything that changes a tile's pixels changes, so saved tiles of the old look are dropped.
+const LOOK_VERSION: u32 = 1;
+const CACHE_REQUESTS_PER_CHECK: usize = 8;
+// The first search decides when tiles can be saved, the later ones only pick up new lamps.
+const LAMP_SEARCH_BUDGET_MS: f64 = 0.2;
+const LAMP_RESEARCH_BUDGET_MS: f64 = 0.05;
+// Structures overhang their pivot, so a tile counts those this close outside it too.
+const BUILD_MARGIN: f64 = 1_000.0;
 const MAX_SHOWN: usize = 49;
 // What "when zoomed in close" means: 400 m across or less.
 const CLOSE_VIEW: f64 = 40_000.0;
@@ -155,6 +167,26 @@ impl TileKey {
         };
         gap(x, self.x).hypot(gap(y, self.y))
     }
+
+    fn cache_key(self) -> CacheKey {
+        CacheKey { x: self.x, y: self.y, level: self.level }
+    }
+}
+
+/// One structure's id, place to the decimetre, and whether it is finished.
+fn build_hash(build: &Build) -> u64 {
+    let mut hash = Fnv::new();
+    for part in build.id.parts {
+        hash.write(&part.to_le_bytes());
+    }
+    hash.write(&((build.x / 10.0).round() as i64).to_le_bytes());
+    hash.write(&((build.y / 10.0).round() as i64).to_le_bytes());
+    hash.write(&[u8::from(build.completed)]);
+    hash.finish()
+}
+
+fn look_name(styled: bool) -> String {
+    format!("v{LOOK_VERSION}-{}", if styled { "map" } else { "natural" })
 }
 
 /// Parts of the game's sky actor (PPSkyCreator) that a lit capture leaves out: clouds and height fog (hidden),
@@ -227,7 +259,6 @@ struct MapStyle {
     address_offsets: [usize; 2],
     resize_target: Function,
     clear_target: Function,
-    clear_hidden: Function,
     all_actors: Function,
     instance_count: Function,
     instance_transform: Function,
@@ -318,7 +349,7 @@ fn blur_passes(texture: Obj, horizontal: bool) -> Vec<Pass> {
 }
 
 impl MapStyle {
-    fn new(rendering: Obj, light_class: Obj, capture_base: Obj, statics: Obj) -> Result<Self, String> {
+    fn new(rendering: Obj, light_class: Obj, statics: Obj) -> Result<Self, String> {
         let canvas = ue::find("/Script/Engine.Canvas")?;
         let instanced = ue::find("/Script/Engine.InstancedStaticMeshComponent")?;
         let target_class = ue::find("/Script/Engine.TextureRenderTarget2D")?;
@@ -327,7 +358,6 @@ impl MapStyle {
             resize_target: Function::resolve(rendering, "ResizeRenderTarget2D", &["TextureRenderTarget", "Width", "Height"])?,
             squared: None,
             clear_target: Function::resolve(rendering, "ClearRenderTarget2D", &["WorldContextObject", "TextureRenderTarget", "ClearColor"])?,
-            clear_hidden: Function::resolve(capture_base, "ClearHiddenComponents", &[])?,
             all_actors: Function::resolve(statics, "GetAllActorsOfClass", &["WorldContextObject", "actorClass", "OutActors"])?,
             instance_count: Function::resolve(instanced, "GetInstanceCount", &[])?,
             instance_transform: Function::resolve(
@@ -461,6 +491,101 @@ impl MapStyle {
     }
 }
 
+/// Every point, spot and rect light in the game (lamps, torches, braziers, glowing pals), found by a search over
+/// all objects that takes a sliver of each frame and starts over when done, so new lamps are found too.
+struct Lamps {
+    class: Obj,
+    intensity_offset: usize,
+    radius_offset: usize,
+    location: Function,
+    cursor: i32,
+    found: Vec<Obj>,
+    seen: HashSet<Weak>,
+    known: Vec<Weak>,
+    known_set: HashSet<Weak>,
+    passes: u32,
+    pass_started: Instant,
+}
+
+impl Lamps {
+    fn new(scene_component: Obj, light_base: Obj) -> Result<Self, String> {
+        let class = ue::find("/Script/Engine.LocalLightComponent")?;
+        Ok(Self {
+            intensity_offset: ue::property_offset(light_base, "Intensity")?,
+            radius_offset: ue::property_offset(class, "AttenuationRadius")?,
+            location: Function::resolve(scene_component, "K2_GetComponentLocation", &[])?,
+            class,
+            cursor: 0,
+            found: Vec::new(),
+            seen: HashSet::new(),
+            known: Vec::new(),
+            known_set: HashSet::new(),
+            passes: 0,
+            pass_started: Instant::now(),
+        })
+    }
+
+    fn world_unload(&mut self) {
+        self.cursor = 0;
+        self.seen.clear();
+        self.known.clear();
+        self.known_set.clear();
+        self.passes = 0;
+    }
+
+    /// Whether the search went over every object at least once.
+    fn known(&self) -> bool {
+        self.passes > 0
+    }
+
+    fn step(&mut self) {
+        if self.cursor == 0 {
+            self.pass_started = Instant::now();
+        }
+        self.found.clear();
+        let budget = if self.passes == 0 { LAMP_SEARCH_BUDGET_MS } else { LAMP_RESEARCH_BUDGET_MS };
+        let next = ue::scan_objects(self.class, self.cursor, budget, &mut self.found);
+        for &light in &self.found {
+            let light = Weak::new(light);
+            self.seen.insert(light);
+            if self.known_set.insert(light) {
+                self.known.push(light);
+            }
+        }
+        self.cursor = next;
+        if next != 0 {
+            return;
+        }
+        if self.passes == 0 {
+            host::info(&format!(
+                "lights for terrain captures: {} found, the search over every object took {:.1} s",
+                self.seen.len(),
+                self.pass_started.elapsed().as_secs_f64()
+            ));
+        }
+        self.passes += 1;
+        self.known = self.seen.drain().collect();
+        self.known_set = self.known.iter().copied().collect();
+    }
+
+    /// The lit lights whose light reaches the tile, with their brightness.
+    fn near(&mut self, key: TileKey) -> Vec<(Obj, f32)> {
+        let mut near = Vec::new();
+        for light in self.known.iter().filter_map(|light| light.get()) {
+            let intensity: f32 = unsafe { light.read(self.intensity_offset) };
+            if intensity <= 0.0 {
+                continue;
+            }
+            let reach: f32 = unsafe { light.read(self.radius_offset) };
+            let at: Vec3 = self.location.call(light, |_| {}).returned();
+            if key.distance(at.x, at.y) <= f64::from(reach) {
+                near.push((light, intensity));
+            }
+        }
+        near
+    }
+}
+
 struct Tile {
     texture: Weak,
     holder: Weak,
@@ -468,6 +593,12 @@ struct Tile {
     last_seen: Instant,
     /// Captured while the area was still streaming in, so captured again once it has settled.
     early: bool,
+    /// Loaded from disk instead of captured this session.
+    cached: bool,
+    /// Loaded from disk but out of date (another game build, or other structures in it), so captured again.
+    stale: bool,
+    /// The player structures in the tile when it was captured.
+    fingerprint: Option<u64>,
 }
 
 /// Terrain rendered from above in tiles, where the game's map art cannot show where the player is: dungeons,
@@ -534,10 +665,19 @@ pub struct Terrain {
     warm_until: Instant,
     last_position: Option<Vec3>,
     region_name: &'static str,
+    clear_hidden: Function,
+    all_characters: Function,
+    character_class: Obj,
+    lamps: Option<Lamps>,
+    /// How many lights the last capture switched off.
+    lamps_off: usize,
+    cache: Option<TileCache>,
+    /// The structures players built, once the map objects were scanned. None while unknown.
+    builds: Option<Vec<Build>>,
 }
 
 impl Terrain {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(engine: Obj) -> Result<Self, String> {
         let actor = ue::find("/Script/Engine.Actor")?;
         let actor_component = ue::find("/Script/Engine.ActorComponent")?;
         let scene_component = ue::find("/Script/Engine.SceneComponent")?;
@@ -568,11 +708,30 @@ impl Terrain {
             host::warning(&format!("lit terrain cannot leave out the game's sky: {reason}"));
         }
         let post_process = ue::find("/Script/Engine.PostProcessSettings")?;
-        let style = MapStyle::new(rendering, light_class, capture_base, statics)
+        let style = MapStyle::new(rendering, light_class, statics)
             .inspect_err(|reason| host::warning(&format!("terrain tiles keep their natural colors: {reason}")))
             .ok();
+        let lamps = Lamps::new(scene_component, light_base)
+            .inspect_err(|reason| host::warning(&format!("lamps stay on in terrain captures, tiles are not saved: {reason}")))
+            .ok();
+        let cache = match settings::cache_folder() {
+            Some(folder) => TileCache::new(folder.join("terrain"), engine)
+                .inspect_err(|reason| host::warning(&format!("rendered terrain is not saved between sessions: {reason}")))
+                .ok(),
+            None => {
+                host::warning("rendered terrain is not saved between sessions: mod folder not found");
+                None
+            }
+        };
         let now = Instant::now();
         Ok(Self {
+            clear_hidden: Function::resolve(capture_base, "ClearHiddenComponents", &[])?,
+            all_characters: Function::resolve(statics, "GetAllActorsOfClass", &["WorldContextObject", "actorClass", "OutActors"])?,
+            character_class: ue::find("/Script/Engine.Character")?,
+            lamps,
+            lamps_off: 0,
+            cache,
+            builds: None,
             actor_of_class: Function::resolve(statics, "GetActorOfClass", &["WorldContextObject", "actorClass"])?,
             set_visibility: Function::resolve(scene_component, "SetVisibility", &["bNewVisibility", "bPropagateToChildren"])?,
             is_visible: Function::resolve(scene_component, "IsVisible", &[])?,
@@ -664,6 +823,13 @@ impl Terrain {
     }
 
     pub fn world_unload(&mut self) {
+        if let Some(cache) = &mut self.cache {
+            cache.world_unload();
+        }
+        self.builds = None;
+        if let Some(lamps) = &mut self.lamps {
+            lamps.world_unload();
+        }
         self.forget_tiles();
         self.component = None;
         self.map_lights = None;
@@ -700,6 +866,9 @@ impl Terrain {
             self.drop_tiles(w, layers, |_| true);
             self.color_map_lights();
             host::info(if styled { "terrain colored like the game's map" } else { "terrain in natural colors" });
+        }
+        if let Some(cache) = &mut self.cache {
+            cache.set_look(&look_name(styled), &[look_name(true), look_name(false)]);
         }
 
         let at = player.location;
@@ -755,13 +924,31 @@ impl Terrain {
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         self.tiles.retain(|_, tile| tile.texture.get().is_some());
+        // Only the overworld is saved: another dungeon can be put where one was before.
+        let caching = settings.terrain_cache && layer == Layer::Surface;
+        if caching && let Some(cache) = &mut self.cache {
+            let mut asked = 0;
+            for (_, key) in &wanted {
+                if asked >= CACHE_REQUESTS_PER_CHECK {
+                    break;
+                }
+                let cache_key = key.cache_key();
+                if !self.tiles.contains_key(key) && !cache.is_loading(cache_key) && cache.request(cache_key) {
+                    asked += 1;
+                }
+            }
+        }
         let mut missing = None;
         if now >= self.next_capture && now >= self.settle_until && self.targets_ready(w, layers, player.world) {
             let settled = now >= self.warm_until;
+            let loading = |key: TileKey| caching && self.cache.as_ref().is_some_and(|cache| cache.is_loading(key.cache_key()));
             let candidates: Vec<TileKey> = wanted
                 .iter()
                 .map(|(_, key)| *key)
-                .filter(|key| self.tiles.get(key).is_none_or(|tile| tile.early && settled))
+                .filter(|&key| match self.tiles.get(&key) {
+                    None => !loading(key),
+                    Some(tile) => settled && (tile.early || tile.stale),
+                })
                 .take(LOAD_CHECKS_PER_TICK)
                 .collect();
             missing = candidates
@@ -770,7 +957,7 @@ impl Terrain {
         }
         if let Some((key, ground)) = missing {
             self.next_capture = now + CAPTURE_GAP;
-            match profile::time("terrain capture", || self.capture_tile(w, layers, player, key, ground)) {
+            match profile::time("terrain capture", || self.capture_tile(w, layers, player, key, ground, caching)) {
                 Ok(()) => self.failures = 0,
                 Err(reason) => {
                     self.failures += 1;
@@ -1461,12 +1648,19 @@ impl Terrain {
                 a.set(1, true);
             });
         }
+        // Lamps, torches and glowing pals: off for the capture only, like the sky lights.
+        let lamps = self.lamps.as_mut().map(|lamps| lamps.near(key)).unwrap_or_default();
+        for &(lamp, _) in &lamps {
+            self.set_light_intensity.call(lamp, |a| a.set(0, 0.0f32));
+        }
         self.capture.call(component, |_| {});
+        for &(lamp, intensity) in &lamps {
+            self.set_light_intensity.call(lamp, |a| a.set(0, intensity));
+        }
+        self.lamps_off = lamps.len();
         if !hidden.is_empty() {
             // Back to hiding only the pawn. The weather is hidden again by the next capture's sky pause.
-            if let Some(style) = &mut self.style {
-                style.clear_hidden.call(component, |_| {});
-            }
+            self.clear_hidden.call(component, |_| {});
             self.hide_actor.call(component, |a| {
                 a.set_obj(0, Some(player.pawn));
                 a.set(1, true);
@@ -1478,7 +1672,16 @@ impl Terrain {
 
     /// In natural colors the tile is captured as the game draws it. With the map look it is captured with the
     /// water hidden, and the look paints the water from the game's water planes.
-    fn capture_tile(&mut self, w: &mut Widgets, layers: &mut Layers, player: &Player, key: TileKey, ground: Ground) -> Result<(), String> {
+    #[allow(clippy::too_many_arguments)]
+    fn capture_tile(
+        &mut self,
+        w: &mut Widgets,
+        layers: &mut Layers,
+        player: &Player,
+        key: TileKey,
+        ground: Ground,
+        save: bool,
+    ) -> Result<(), String> {
         let started = Instant::now();
         let world = player.world;
         let target = self.new_target(world, RGBA8_SRGB)?;
@@ -1493,7 +1696,9 @@ impl Terrain {
             },
             _ => None,
         };
-        let (hidden, water) = if capture.is_some() { self.water(world) } else { Default::default() };
+        let (mut hidden, water) = if capture.is_some() { self.water(world) } else { Default::default() };
+        // Pals, people and other players move on, so they stay out of tiles that are kept.
+        hidden.extend(self.characters(world));
         let (camera_z, camera_height) = match self.render(player, key, ground, capture.unwrap_or(target), &hidden) {
             Ok(rendered) => rendered,
             Err(reason) => {
@@ -1513,29 +1718,204 @@ impl Terrain {
         }
 
         let early = Instant::now() < self.warm_until;
-        let tile = Tile { texture: Weak::new(target), holder, outside: self.outside, last_seen: Instant::now(), early };
+        let fingerprint = self.fingerprint(key);
+        let tile = Tile {
+            texture: Weak::new(target),
+            holder,
+            outside: self.outside,
+            last_seen: Instant::now(),
+            early,
+            cached: false,
+            stale: false,
+            fingerprint,
+        };
         let again = self.tiles.insert(key, tile).map(|old| layers.release(w, old.holder)).is_some();
+        let cost = started.elapsed();
+        // Until every light was found once, a lamp could be lit in the tile, and its light would stay in it.
+        let lamps_known = self.lamps.as_ref().is_some_and(Lamps::known);
+        let saved = if save && !early && key.layer == Layer::Surface && self.cache.is_some() {
+            if lamps_known {
+                if let Some(cache) = &mut self.cache {
+                    cache.queue_save(key.cache_key(), target, fingerprint);
+                }
+                ""
+            } else {
+                ", not saved (lights not all found yet)"
+            }
+        } else {
+            ""
+        };
         self.evict(w, layers);
         host::info(&format!(
-            "terrain tile {},{} level {} ({:?}) rendered{}, camera {camera_height:.0} m over the ground's lowest point, {:.2} ms on the game thread, {} tiles kept{}",
+            "terrain tile {},{} level {} ({:?}) rendered{}, camera {camera_height:.0} m over the ground's lowest point, {} lights off, {:.2} ms on the game thread, {} tiles kept{}{saved}",
             key.x,
             key.y,
             key.level,
             key.layer,
             if again { " again" } else { "" },
-            started.elapsed().as_secs_f64() * 1000.0,
+            self.lamps_off,
+            cost.as_secs_f64() * 1000.0,
             self.tiles.len(),
             if early { ", early, will be captured again" } else { "" }
         ));
         Ok(())
     }
 
+    fn characters(&mut self, world: Obj) -> Vec<Obj> {
+        let (statics, class) = (self.statics, self.character_class);
+        self.all_characters.call_reusing(statics, |a| {
+            a.set_obj(0, Some(world));
+            a.set_obj(1, Some(class));
+        });
+        self.all_characters.param_objects(2)
+    }
+
+    /// A hash of the player structures in and just around a tile, or None while they are not known.
+    fn fingerprint(&self, key: TileKey) -> Option<u64> {
+        if key.layer != Layer::Surface {
+            return None;
+        }
+        let builds = self.builds.as_ref()?;
+        let units = key.units();
+        let (low_x, low_y) = (f64::from(key.x) * units - BUILD_MARGIN, f64::from(key.y) * units - BUILD_MARGIN);
+        let span = units + 2.0 * BUILD_MARGIN;
+        let mut inside: Vec<u64> = builds
+            .iter()
+            .filter(|build| build.x >= low_x && build.x < low_x + span && build.y >= low_y && build.y < low_y + span)
+            .map(build_hash)
+            .collect();
+        // Sorted by each structure's own hash, so the order the game lists them in does not matter.
+        inside.sort_unstable();
+        let mut hash = Fnv::new();
+        for value in inside {
+            hash.write(&value.to_le_bytes());
+        }
+        Some(hash.finish())
+    }
+
+    /// The structures players built, after each map object scan. A tile whose structures changed is captured
+    /// again. `models` is how many map objects the host had: none means they are not known here.
+    pub fn set_builds(&mut self, builds: &[Build], models: usize) {
+        let known = (models > 0).then(|| builds.to_vec());
+        let hashes = |builds: &Option<Vec<Build>>| -> HashMap<u64, Build> {
+            builds.iter().flatten().map(|build| (build_hash(build), *build)).collect()
+        };
+        let (before, after) = (hashes(&self.builds), hashes(&known));
+        if known.is_some() == self.builds.is_some() && before.len() == after.len() && before.keys().all(|key| after.contains_key(key)) {
+            self.builds = known;
+            return;
+        }
+        let list = |from: &HashMap<u64, Build>, without: &HashMap<u64, Build>| -> (usize, String) {
+            let changed: Vec<&Build> = from.iter().filter(|(key, _)| !without.contains_key(key)).map(|(_, build)| build).collect();
+            let shown: Vec<String> = changed
+                .iter()
+                .take(6)
+                .map(|build| format!("{}{}", build.kind.text(), if build.completed { "" } else { " (building)" }))
+                .collect();
+            (changed.len(), shown.join(", "))
+        };
+        let ((added, added_kinds), (removed, removed_kinds)) = (list(&after, &before), list(&before, &after));
+        host::info(&match &known {
+            Some(builds) => format!(
+                "player structures for rendered terrain: {}, {} with no instance id, {added} new ({added_kinds}), {removed} gone ({removed_kinds})",
+                builds.len(),
+                builds.iter().filter(|build| build.id == Guid::default()).count()
+            ),
+            None => "player structures for rendered terrain: not known here".to_string(),
+        });
+        self.builds = known;
+        let keys: Vec<TileKey> = self.tiles.keys().filter(|key| key.layer == Layer::Surface).copied().collect();
+        let mut changed = 0;
+        for key in keys {
+            let now = self.fingerprint(key);
+            let Some(tile) = self.tiles.get_mut(&key) else { continue };
+            match (tile.fingerprint, now) {
+                (Some(before), Some(now)) if before != now => {
+                    if tile.cached {
+                        tile.stale = true;
+                    } else {
+                        tile.early = true;
+                    }
+                    changed += 1;
+                }
+                (None, Some(now)) if !tile.cached => tile.fingerprint = Some(now),
+                _ => {}
+            }
+        }
+        if changed > 0 {
+            host::info(&format!("{changed} terrain tiles have changed structures, capturing them again"));
+        }
+    }
+
+    /// Runs every frame, shown or not: moves saves along, and puts tiles read from disk in place.
+    pub fn maintain(&mut self, w: &mut Widgets, layers: &mut Layers, world: Obj) {
+        if let Some(lamps) = &mut self.lamps {
+            profile::time("lamp search", || lamps.step());
+        }
+        let Some(cache) = &mut self.cache else { return };
+        cache.tick();
+        let Some((cache_key, png, decode)) = cache.take_loaded() else { return };
+        let entry = cache.entry(cache_key);
+        let key = TileKey { x: cache_key.x, y: cache_key.y, level: cache_key.level, layer: Layer::Surface };
+        if self.tiles.contains_key(&key) {
+            return;
+        }
+        let started = Instant::now();
+        let Some(texture) = profile::time("tile import", || w.import_png(world, &png)) else {
+            host::warning(&format!("cached terrain tile {},{} level {} could not be imported", key.x, key.y, key.level));
+            return;
+        };
+        let imported = started.elapsed();
+        let Some(holder) = layers.hold(w, texture) else { return };
+        let fingerprint = entry.and_then(|entry| entry.fingerprint);
+        let now_fingerprint = self.fingerprint(key);
+        let stale = match (&self.cache, entry) {
+            (Some(cache), Some(entry)) => cache.stale(entry, now_fingerprint),
+            _ => false,
+        };
+        let tile = Tile {
+            texture: Weak::new(texture),
+            holder,
+            outside: false,
+            last_seen: Instant::now(),
+            early: false,
+            cached: true,
+            stale,
+            fingerprint,
+        };
+        self.tiles.insert(key, tile);
+        self.evict(w, layers);
+        self.next_check = Instant::now();
+        host::info(&format!(
+            "terrain tile {},{} level {} loaded from disk{}, prepared in {:.1} ms on the cache thread, imported in {:.2} ms",
+            key.x,
+            key.y,
+            key.level,
+            if stale { ", out of date, will be captured again" } else { "" },
+            decode.as_secs_f64() * 1000.0,
+            imported.as_secs_f64() * 1000.0
+        ));
+    }
+
+    /// Deletes every saved tile and drops the overworld tiles kept now, so they are captured and saved fresh.
+    pub fn clear_cache(&mut self, w: &mut Widgets, layers: &mut Layers) {
+        let Some(cache) = &mut self.cache else { return };
+        cache.clear();
+        self.drop_tiles(w, layers, |tile| !tile.outside);
+        self.next_check = Instant::now();
+    }
+
     fn evict(&mut self, w: &mut Widgets, layers: &mut Layers) {
         while self.tiles.len() > MAX_TILES {
+            let crowded = self.tiles.len() > MAX_TILES + SAVING_SLACK;
+            let saving = |key: &TileKey| {
+                key.layer == Layer::Surface && self.cache.as_ref().is_some_and(|cache| cache.is_saving(key.cache_key()))
+            };
             let oldest = self
                 .tiles
                 .iter()
                 .filter(|(key, _)| !self.slots.contains(&Some(**key)))
+                .filter(|(key, _)| crowded || !saving(key))
                 .min_by_key(|(_, tile)| tile.last_seen)
                 .map(|(key, _)| *key);
             let Some(key) = oldest else { break };

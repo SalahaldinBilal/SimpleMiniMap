@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-pub const API_VERSION: u32 = 9;
+pub const API_VERSION: u32 = 10;
 
 // Field order must match SmmHostApi in shim/include/smm_host.h.
 #[repr(C)]
@@ -42,6 +42,23 @@ pub struct HostApi {
     pub set_bool_property: unsafe extern "C" fn(object: *mut c_void, name: *const u8, len: usize, value: bool) -> bool,
     pub set_struct_bool:
         unsafe extern "C" fn(ustruct: *mut c_void, container: *mut c_void, name: *const u8, len: usize, value: bool) -> bool,
+    pub set_string: unsafe extern "C" fn(
+        ustruct: *mut c_void,
+        container: *mut c_void,
+        name: *const u8,
+        len: usize,
+        text: *const u8,
+        text_len: usize,
+    ) -> bool,
+    pub set_rooted: unsafe extern "C" fn(object: *mut c_void, rooted: bool),
+    pub scan_objects: unsafe extern "C" fn(
+        class: *mut c_void,
+        start: i32,
+        budget_ms: f64,
+        out: *mut *mut c_void,
+        capacity: i32,
+        out_count: *mut i32,
+    ) -> i32,
 }
 
 static HOST: OnceLock<HostApi> = OnceLock::new();

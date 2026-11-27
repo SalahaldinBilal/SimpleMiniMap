@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <string_view>
 #include <utility>
@@ -8,6 +9,7 @@
 #include <Helpers/String.hpp>
 #include <Mod/CppUserModBase.hpp>
 #include <Unreal/Core/Containers/Array.hpp>
+#include <Unreal/CoreUObject/UObject/FStrProperty.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/Engine/UDataTable.hpp>
 #include <Unreal/FField.hpp>
@@ -329,6 +331,70 @@ namespace
         });
     }
 
+    // Assigned through the engine's allocator, so the engine can free it later.
+    bool host_set_string(void* ustruct, void* container, const char* name, size_t len, const char* text, size_t text_len)
+    {
+        return guarded(STR("set_string"), false, [&]() -> bool {
+            auto wide = widen(name, len);
+            auto* property = CastField<FStrProperty>(static_cast<UStruct*>(ustruct)->FindProperty(FName(wide.c_str(), FNAME_Find)));
+            if (!property)
+            {
+                return false;
+            }
+            auto value = widen(text, text_len);
+            *property->ContainerPtrToValuePtr<FString>(container) = FString(value);
+            return true;
+        });
+    }
+
+    void host_set_rooted(void* object, bool rooted)
+    {
+        guarded(STR("set_rooted"), 0, [&]() -> int {
+            if (rooted)
+            {
+                to_object(object)->SetRootSet();
+            }
+            else
+            {
+                to_object(object)->ClearRootSet();
+            }
+            return 0;
+        });
+    }
+
+    // One slice of a walk over every object, so a whole pass is spread over many frames instead of one hitch.
+    int32_t host_scan_objects(void* uclass, int32_t start, double budget_ms, void** out, int32_t capacity, int32_t* out_count)
+    {
+        *out_count = 0;
+        return guarded(STR("scan_objects"), int32_t{0}, [&]() -> int32_t {
+            auto* wanted = static_cast<UClass*>(uclass);
+            const int32_t total = UObjectArray::GetNumElements();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double, std::milli>(budget_ms);
+            int32_t count = 0;
+            int32_t index = std::max(start, int32_t{0});
+            for (; index < total && count < capacity; ++index)
+            {
+                if ((index & 255) == 0 && std::chrono::steady_clock::now() >= deadline)
+                {
+                    break;
+                }
+                auto* item = UObjectArray::IndexToObject(index);
+                if (!item || item->IsUnreachable())
+                {
+                    continue;
+                }
+                auto* object = item->GetUObject();
+                if (!object || object->HasAnyFlags(RF_ClassDefaultObject) || object->HasAnyFlags(RF_ArchetypeObject) || !object->IsA(wanted))
+                {
+                    continue;
+                }
+                out[count++] = object;
+            }
+            *out_count = count;
+            return index >= total ? 0 : index;
+        });
+    }
+
     void host_bind_key(uint8_t key, uint8_t modifiers, uint32_t action);
 
     void* host_find_instance(const char* class_name, size_t len)
@@ -372,6 +438,9 @@ namespace
         .read_render_target = &host_read_render_target,
         .set_bool_property = &host_set_bool_property,
         .set_struct_bool = &host_set_struct_bool,
+        .set_string = &host_set_string,
+        .set_rooted = &host_set_rooted,
+        .scan_objects = &host_scan_objects,
     };
 } // namespace
 

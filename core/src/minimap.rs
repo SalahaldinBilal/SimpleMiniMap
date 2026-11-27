@@ -11,7 +11,7 @@ use crate::icons::{self, IconClassFinder, IconTable};
 use crate::keys::Keys;
 use crate::layers::{self, BackingShape, Layers};
 use crate::markers::Locations;
-use crate::menu::{Menu, MenuContent};
+use crate::menu::{Command, Menu, MenuContent};
 use crate::objects::{MapObject, MapObjects};
 use crate::profile;
 use crate::settings::{CATEGORIES, LANDMARK_KINDS, Settings, format_keys};
@@ -1903,7 +1903,7 @@ impl Minimap {
                 .map_err(|reason| host::warning(&format!("world-wide map objects disabled: {reason}")))
                 .ok(),
             object_list: Vec::new(),
-            terrain: Terrain::new()
+            terrain: Terrain::new(engine)
                 .map_err(|reason| host::warning(&format!("rendered terrain disabled: {reason}")))
                 .ok(),
             sources_tried: false,
@@ -1975,6 +1975,13 @@ impl Minimap {
         };
         if menu.update(player.world, player.controller, settings, keys, assets, &mut content) {
             self.apply_settings(&before, player.world);
+        }
+        if self.menu.take_command() == Some(Command::ClearTerrainCache) {
+            let Self { menu, terrain, live, .. } = self;
+            match (terrain.as_mut(), live.as_mut()) {
+                (Some(terrain), Some(live)) => terrain.clear_cache(menu.widgets(), &mut live.layers),
+                _ => host::warning("terrain cache not cleared: rendered terrain is not running"),
+            }
         }
     }
 
@@ -2236,6 +2243,9 @@ impl Minimap {
             }
             ui.set_shown(widget, show);
         }
+        if let Some(terrain) = terrain.as_mut() {
+            profile::time("terrain cache", || terrain.maintain(w, &mut live.layers, player.world));
+        }
         if !show {
             return;
         }
@@ -2283,6 +2293,10 @@ impl Minimap {
                     });
                     if learned {
                         *unsaved_since = Some(now);
+                    }
+                    if let Some(terrain) = terrain.as_mut() {
+                        let (builds, models) = objects.builds();
+                        terrain.set_builds(builds, models);
                     }
                 }
             }

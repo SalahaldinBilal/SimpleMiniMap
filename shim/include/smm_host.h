@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SMM_HOST_API_VERSION 9
+#define SMM_HOST_API_VERSION 10
 
 enum SmmModifier
 {
@@ -47,6 +47,9 @@ typedef struct SmmHostApi
     int32_t (*read_render_target)(void* world, void* render_target, uint32_t* out_pixels, int32_t capacity);
     bool (*set_bool_property)(void* object, const char* name, size_t len, bool value);
     bool (*set_struct_bool)(void* ustruct, void* container, const char* name, size_t len, bool value);
+    bool (*set_string)(void* ustruct, void* container, const char* name, size_t len, const char* text, size_t text_len);
+    void (*set_rooted)(void* object, bool rooted);
+    int32_t (*scan_objects)(void* uclass, int32_t start, double budget_ms, void** out, int32_t capacity, int32_t* out_count);
 } SmmHostApi;
 
 #ifdef __cplusplus

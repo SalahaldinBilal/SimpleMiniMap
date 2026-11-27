@@ -5,7 +5,7 @@ Requires [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3625223587]
 [h2]Features[/h2]
 [list]
 [*]A corner minimap that uses the game's own map, its explored-area clouds and its icons.
-[*]Rendered terrain: the ground around you is captured from above once per area and kept, so it is far more detailed than the map art. It works in the overworld and in dungeons, where roofs are left out so you can see the rooms. By default it is colored to look like the game's own map.
+[*]Rendered terrain: the ground around you is captured from above once per area and kept, so it is far more detailed than the map art. It works in the overworld and in dungeons, where roofs are left out so you can see the rooms. By default it is colored to look like the game's own map, and overworld terrain is saved to disk so areas you have been to show right away next time.
 [*]Markers for fast travel points, bases, dungeons, towers, bosses, quests, warps, oil rigs, supply drops, treasure maps, death drops and pins.
 [*]Markers for wild, shiny and own pals, humans and other players, with pal portraits and an above or below arrow when they are on another level.
 [*]Markers for chests, eggs, effigies, notes, junk, ore, skill fruit trees, lotuses, forage, fishing spots and items lying on the ground. Every type can be switched on or off.
@@ -32,7 +32,8 @@ Settings save as you change them. They are also kept in settings.ini in the mod'
 
 [h2]Notes[/h2]
 [list]
-[*]Rendered terrain uses fixed lighting, so tiles match at any time of day. With map colors off, lakes that get their colour from reflecting the sky can show through to the lake bed. Lamps can brighten tiles captured near them at night.
+[*]Rendered terrain uses fixed lighting, so tiles match at any time of day. With map colors off, lakes that get their colour from reflecting the sky can show through to the lake bed. Lamps, torches and glowing pals are switched off for the moment of each capture, though their glowing surfaces can still show as small bright spots.
+[*]Saved terrain is captured again when the game updates or when structures in that area change. The settings window can turn saving off or clear what was saved.
 [*]Built against the UE4SS version the Workshop serves. When UE4SS Experimental updates, update this mod too.
 [/list]
 

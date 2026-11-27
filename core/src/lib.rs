@@ -13,6 +13,7 @@ mod objects;
 mod profile;
 mod settings;
 mod terrain;
+mod tilecache;
 mod ue;
 mod widgets;
 mod worldmap;
