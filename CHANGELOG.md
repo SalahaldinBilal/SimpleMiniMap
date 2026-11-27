@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-27
+
 - Rendered overworld terrain is saved to disk and loaded back in later sessions, so areas you have been to show right away. Tiles are captured again when the game updates or when structures in them change. Pals and people are left out of all rendered terrain now, and lamps no longer light up tiles captured at night. The settings window has a switch to turn saving off and a button to clear what was saved.
 
 ## [0.2.3] - 2026-11-27
